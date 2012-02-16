@@ -23,7 +23,7 @@
 #endif
 
 #if (defined(__APPLE__) && defined(__MACH__))
-#define PLATFORM_MACOSX 1
+//#define PLATFORM_MACOSX 1
 #endif
 
 #if PLATFORM_MACOSX
@@ -2304,7 +2304,6 @@ void MOJOSHADER_glProgramReady(void)
         const MOJOSHADER_preshader *preshader = NULL;
         uint32 i;
 
-        #if SUPPORT_PRESHADERS
         int ran_preshader = 0;
         if (program->vertex)
         {
@@ -2330,7 +2329,6 @@ void MOJOSHADER_glProgramReady(void)
 
         if (ran_preshader)
             ctx->generation++;
-        #endif
 
         for (i = 0; i < count; i++)
         {

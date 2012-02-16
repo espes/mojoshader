@@ -176,8 +176,15 @@ static void print_preshader_operand(const MOJOSHADER_preshader *preshader,
             char regch = 'c';
             if (operand->type == MOJOSHADER_PRESHADEROPERAND_TEMP)
                 regch = 'r';
+            if (operand->type == MOJOSHADER_PRESHADEROPERAND_OUTPUT)
+                regch = 'd';
 
             printf("%c%d", regch, operand->index / 4);
+            
+            if (operand->indexingType == 2) {
+                printf("[%c%d]", 'c', operand->indexingIndex / 4);
+            }
+            
             if (isscalar)
                 printf(".%c", mask[idx]);
             else if (elems != 4)
@@ -486,7 +493,27 @@ static int do_parse(const char *fname, const unsigned char *buf,
         print_effect(fname, effect, 1);
         MOJOSHADER_freeEffect(effect);
     } // if
-
+    else if ( buf[1] == 0x02 && buf[2] == 0x58 && buf[3] == 0x46)
+    {
+        //special preshader-only block
+        MOJOSHADER_parseData* pd = MOJOSHADER_parseExpression(buf, len, Malloc, Free, 0);
+        retval = (pd->error_count == 0);
+        print_preshader(pd->preshader, 0);
+        
+        float*inRegs = (float*)malloc(sizeof(float)*4*32);
+        int i;
+        for (i=0; i<4*128; i++) {
+            inRegs[i] = (float)i;
+        }
+        inRegs[32*4] = 3.f;
+        float*outRegs = (float*)malloc(sizeof(float)*4);
+        
+        MOJOSHADER_runPreshader(pd->preshader, inRegs, outRegs);
+        
+        printf("%d\n", (int)outRegs[0]);
+        
+        MOJOSHADER_freeParseData(pd);
+    }
     else  // do it as a regular compiled shader.
     {
         const MOJOSHADER_parseData *pd;

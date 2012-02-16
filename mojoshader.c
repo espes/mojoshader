@@ -2133,6 +2133,16 @@ static void emit_GLSL_start(Context *ctx, const char *profilestr)
 static void emit_GLSL_RET(Context *ctx);
 static void emit_GLSL_end(Context *ctx)
 {
+    
+    if (ctx->shader_type == MOJOSHADER_TYPE_VERTEX) {
+        //fix the opengl/directx coord mapping
+        //see wine glsl_shader.c for details
+        //TODO: fix if we've already seen a ret
+        output_line(ctx, "gl_Position.y = gl_Position.y * posFixup.y;");
+        output_line(ctx, "gl_Position.xy += posFixup.zw * gl_Position.ww;");
+        //output_line(ctx, "gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;");
+    }
+    
     // force a RET opcode if we're at the end of the stream without one.
     if (ctx->previous_opcode != OPCODE_RET)
         emit_GLSL_RET(ctx);
@@ -2156,6 +2166,7 @@ static void output_GLSL_uniform_array(Context *ctx, const RegisterType regtype,
 
 static void emit_GLSL_finalize(Context *ctx)
 {
+    
     // throw some blank lines around to make source more readable.
     push_output(ctx, &ctx->globals);
     output_blank_line(ctx);
@@ -2172,6 +2183,11 @@ static void emit_GLSL_finalize(Context *ctx)
     output_GLSL_uniform_array(ctx, REG_TYPE_CONST, ctx->uniform_float4_count);
     output_GLSL_uniform_array(ctx, REG_TYPE_CONSTINT, ctx->uniform_int4_count);
     output_GLSL_uniform_array(ctx, REG_TYPE_CONSTBOOL, ctx->uniform_bool_count);
+    
+    if (ctx->shader_type == MOJOSHADER_TYPE_VERTEX) {
+        output_line(ctx, "uniform vec4 posFixup;");
+    }
+    
     pop_output(ctx);
 } // emit_GLSL_finalize
 
@@ -2423,6 +2439,8 @@ static void emit_GLSL_attribute(Context *ctx, RegisterType regtype, int regnum,
 
         else if (regtype == REG_TYPE_OUTPUT)
         {
+            push_output(ctx, &ctx->globals);
+            
             switch (usage)
             {
                 case MOJOSHADER_USAGE_POSITION:
@@ -2433,35 +2451,46 @@ static void emit_GLSL_attribute(Context *ctx, RegisterType regtype, int regnum,
                     break;
                 case MOJOSHADER_USAGE_COLOR:
                     index_str[0] = '\0';  // no explicit number.
-                    if (index == 0)
-                        usage_str = "gl_FrontColor";
-                    else if (index == 1)
-                        usage_str = "gl_FrontSecondaryColor";
+                    
+                    if (index == 0) {
+                        output_line(ctx, "varying vec4 vFrontColor;");
+                        //usage_str = "gl_FrontColor";
+                        usage_str = "vFrontColor";
+                    } else if (index == 1) {
+                        output_line(ctx, "varying vec4 vFrontSecondaryColor;");
+                        //usage_str = "gl_FrontSecondaryColor";
+                        usage_str = "vFrontSecondaryColor";
+                    }
+                    
                     break;
                 case MOJOSHADER_USAGE_FOG:
-                    usage_str = "gl_FogFragCoord";
+                    output_line(ctx, "varying float vFogFragCoord;");
+                    //usage_str = "gl_FogFragCoord";
+                    usage_str = "vFogFragCoord";
                     break;
                 case MOJOSHADER_USAGE_TEXCOORD:
                     snprintf(index_str, sizeof (index_str), "%u", (uint) index);
-                    usage_str = "gl_TexCoord";
-                    arrayleft = "[";
-                    arrayright = "]";
+                    output_line(ctx, "varying vec4 vTexCoord%s;", index_str);
+                    usage_str = "vTexCoord";
+                    //usage_str = "gl_TexCoord";
+                    //arrayleft = "[";
+                    //arrayright = "]";
                     break;
                 default:
                     // !!! FIXME: we need to deal with some more built-in varyings here.
                     break;
             } // switch
-
+            
             // !!! FIXME: the #define is a little hacky, but it means we don't
             // !!! FIXME:  have to track these separately if this works.
-            push_output(ctx, &ctx->globals);
             // no mapping to built-in var? Just make it a regular global, pray.
             if (usage_str == NULL)
                 output_line(ctx, "vec4 %s;", var);
             else
             {
-                output_line(ctx, "#define %s %s%s%s%s", var, usage_str,
-                            arrayleft, index_str, arrayright);
+                //output_line(ctx, "#define %s %s%s%s%s", var, usage_str,
+                //            arrayleft, index_str, arrayright);
+                output_line(ctx, "#define %s %s%s", var, usage_str, index_str);
             } // else
             pop_output(ctx);
         } // else if
@@ -2501,24 +2530,33 @@ static void emit_GLSL_attribute(Context *ctx, RegisterType regtype, int regnum,
         // !!! FIXME: can you actualy have a texture register with COLOR usage?
         else if ((regtype == REG_TYPE_TEXTURE) || (regtype == REG_TYPE_INPUT))
         {
+            push_output(ctx, &ctx->globals);
             if (usage == MOJOSHADER_USAGE_TEXCOORD)
             {
                 snprintf(index_str, sizeof (index_str), "%u", (uint) index);
-                usage_str = "gl_TexCoord";
-                arrayleft = "[";
-                arrayright = "]";
+                output_line(ctx, "varying vec4 vTexCoord%s;", index_str);
+                output_line(ctx, "#define %s vTexCoord%s", var, index_str);
+                //usage_str = "gl_TexCoord";
+                //arrayleft = "[";
+                //arrayright = "]";
             } // if
 
             else if (usage == MOJOSHADER_USAGE_COLOR)
             {
                 index_str[0] = '\0';  // no explicit number.
-                if (index == 0)
-                    usage_str = "gl_Color";
-                else if (index == 1)
-                    usage_str = "gl_SecondaryColor";
-                else
+                if (index == 0) {
+                    output_line(ctx, "varying vec4 vFrontColor;");
+                    usage_str = "vFrontColor";
+                    //usage_str = "gl_Color";
+                } else if (index == 1) {
+                    output_line(ctx, "varying vec4 vFrontSecondaryColor;");
+                    usage_str = "vFrontSecondaryColor";
+                    //usage_str = "gl_SecondaryColor";
+                } else {
                     fail(ctx, "unsupported color index");
+                }
             } // else if
+            pop_output(ctx);
         } // else if
 
         else if (regtype == REG_TYPE_MISCTYPE)
@@ -7039,7 +7077,7 @@ static void parse_constant_table(Context *ctx, const uint32 *tokens,
     if (size != CTAB_SIZE)
         goto corrupt_ctab;
 
-    if (version != okay_version) goto corrupt_ctab;
+    //if (version != okay_version) goto corrupt_ctab;
     if (creator >= bytes) goto corrupt_ctab;
     if ((constantinfo + (constants * CINFO_SIZE)) >= bytes) goto corrupt_ctab;
     if (target >= bytes) goto corrupt_ctab;
@@ -7156,13 +7194,14 @@ typedef struct PreshaderBlockInfo
 static void parse_preshader(Context *ctx, uint32 tokcount)
 {
     const uint32 *tokens = ctx->tokens;
-    if ((tokcount < 2) || (SWAP32(tokens[1]) != PRES_ID))
-        return;  // not a preshader.
-
-#if !SUPPORT_PRESHADERS
-    fail(ctx, "Preshader found, but preshader support is disabled!");
-#else
-
+    
+    if (SWAP32(tokens[1]) == PRES_ID) {
+        if (tokcount <= 2) return;
+        //hax
+        tokens += 2;
+        tokcount -= 2;
+    }
+    
     assert(ctx->have_preshader == 0);  // !!! FIXME: can you have more than one?
     ctx->have_preshader = 1;
 
@@ -7171,15 +7210,15 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
     // !!! FIXME:  nothing else.
     // !!! FIXME: 0x02 0x01 is probably the version (fx_2_1),
     // !!! FIXME:  and 0x4658 is the magic, like a real shader's version token.
-    const uint32 okay_version = 0x46580201;
-    if (SWAP32(tokens[2]) != okay_version)
+    const uint32 okay_versions[] = {0x46580201, 0x46580200};
+    if (SWAP32(tokens[0]) != okay_versions[0] && SWAP32(tokens[0]) != okay_versions[1])
     {
-        fail(ctx, "Unsupported preshader version.");
+        failf(ctx, "Unsupported preshader version %6x.", tokens[0]);
         return;  // fail because the shader will malfunction w/o this.
     } // if
 
-    tokens += 3;
-    tokcount -= 3;
+    tokens += 1;
+    tokcount -= 1;
 
     // All sections of a preshader are packed into separate comment tokens,
     //  inside the containing comment token block. Find them all before
@@ -7234,7 +7273,7 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
     } // while
 
     if (!ctab.seen) { fail(ctx, "No CTAB block in preshader."); return; }
-    if (!prsi.seen) { fail(ctx, "No PRSI block in preshader."); return; }
+    //if (!prsi.seen) { fail(ctx, "No PRSI block in preshader."); return; }
     if (!fxlc.seen) { fail(ctx, "No FXLC block in preshader."); return; }
     if (!clit.seen) { fail(ctx, "No CLIT block in preshader."); return; }
 
@@ -7271,35 +7310,43 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
         } // else if
     } // else
 
-    // Parse out the PRSI block. This is used to map the output registers.
-    if (prsi.tokcount < 8)
-    {
-        fail(ctx, "Bogus preshader PRSI data");
-        return;
-    } // if
+
 
     //const uint32 first_output_reg = SWAP32(prsi.tokens[1]);
     // !!! FIXME: there are a lot of fields here I don't know about.
     // !!! FIXME:  maybe [2] and [3] are for int4 and bool registers?
     //const uint32 output_reg_count = SWAP32(prsi.tokens[4]);
     // !!! FIXME:  maybe [5] and [6] are for int4 and bool registers?
-    const uint32 output_map_count = SWAP32(prsi.tokens[7]);
+    uint32 output_map_count;
+    const uint32 *output_map = NULL;
+    if (prsi.seen) {
+        // Parse out the PRSI block. This is used to map the output registers.
+        if (prsi.tokcount < 8)
+        {
+            fail(ctx, "Bogus preshader PRSI data");
+            return;
+        } // if
+        
+        output_map_count = SWAP32(prsi.tokens[7]);
+        
+        prsi.tokcount -= 8;
+        prsi.tokens += 8;
 
-    prsi.tokcount -= 8;
-    prsi.tokens += 8;
-
-    if (prsi.tokcount < ((output_map_count + 1) * 2))
-    {
-        fail(ctx, "Bogus preshader PRSI data");
-        return;
-    } // if
-
-    const uint32 *output_map = prsi.tokens;
+        if (prsi.tokcount < ((output_map_count + 1) * 2))
+        {
+            fail(ctx, "Bogus preshader PRSI data");
+            return;
+        } // if
+        
+        output_map = prsi.tokens;
+    } else {
+        output_map_count = 0;
+    }
 
     // Now we'll figure out the CTAB...
     CtabData ctabdata = { 0, 0, 0 };
     parse_constant_table(ctx, ctab.tokens - 1, ctab.tokcount * 4,
-                         okay_version, 0, &ctabdata);
+                         okay_versions[1], 0, &ctabdata);
 
     // preshader owns this now. Don't free it in this function.
     preshader->symbol_count = ctabdata.symbol_count;
@@ -7334,8 +7381,9 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
     while (opcode_count--)
     {
         const uint32 opcodetok = SWAP32(fxlc.tokens[0]);
+        
         MOJOSHADER_preshaderOpcode opcode = MOJOSHADER_PRESHADEROP_NOP;
-        switch ((opcodetok >> 16) & 0xFFFF)
+        switch ((opcodetok >> 16) & 0x7FF0)
         {
             case 0x1000: opcode = MOJOSHADER_PRESHADEROP_MOV; break;
             case 0x1010: opcode = MOJOSHADER_PRESHADEROP_NEG; break;
@@ -7391,23 +7439,46 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
         MOJOSHADER_preshaderOperand *operand = inst->operands;
         while (operand_count--)
         {
+            
+            // !!! FIXME: don't quite know how this works
+            unsigned int subOps = (unsigned int) SWAP32(fxlc.tokens[0]);
+            operand->indexingType = 0;
+            while (subOps--) {
+                switch (fxlc.tokens[1]) {
+                    case 2:
+                    {
+                        operand->indexingType = 2;
+                        operand->indexingIndex = fxlc.tokens[2];
+                        break;
+                    }
+                    default:
+                    {
+                        failf(ctx, "unkn indexer %d\n", fxlc.tokens[1]);
+                        break;
+                    }
+                }
+                //type info?
+                fxlc.tokens += 2;
+                fxlc.tokcount -= 2;
+            }
+            
             const unsigned int item = (unsigned int) SWAP32(fxlc.tokens[2]);
+            
+            operand->type = SWAP32(fxlc.tokens[1]);
 
-            // !!! FIXME: don't know what first token does.
-            switch (SWAP32(fxlc.tokens[1]))
+            switch (operand->type)
             {
-                case 1:  // literal from CLIT block.
+                case MOJOSHADER_PRESHADEROPERAND_LITERAL:  // literal from CLIT block.
                 {
                     if (item >= preshader->literal_count)
                     {
                         fail(ctx, "Bogus preshader literal index.");
                         break;
                     } // if
-                    operand->type = MOJOSHADER_PRESHADEROPERAND_LITERAL;
                     break;
                 } // case
 
-                case 2:  // item from ctabdata.
+                case MOJOSHADER_PRESHADEROPERAND_INPUT:  // item from ctabdata.
                 {
                     int i;
                     MOJOSHADER_symbol *sym = ctabdata.symbols;
@@ -7424,11 +7495,10 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
                         fail(ctx, "Bogus preshader input index.");
                         break;
                     } // if
-                    operand->type = MOJOSHADER_PRESHADEROPERAND_INPUT;
                     break;
                 } // case
 
-                case 4:
+                case MOJOSHADER_PRESHADEROPERAND_OUTPUT:
                 {
                     int i;
                     for (i = 0; i < output_map_count; i++)
@@ -7438,23 +7508,26 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
                         if ( (base <= item) && ((base + count) > item) )
                             break;
                     } // for
-                    if (i == output_map_count)
+                    if (output_map_count > 0 && i == output_map_count)
                     {
                         fail(ctx, "Bogus preshader output index.");
                         break;
                     } // if
 
-                    operand->type = MOJOSHADER_PRESHADEROPERAND_OUTPUT;
                     break;
                 } // case
 
-                case 7:
+                case MOJOSHADER_PRESHADEROPERAND_TEMP:
                 {
-                    operand->type = MOJOSHADER_PRESHADEROPERAND_TEMP;
                     if (item >= preshader->temp_count)
                         preshader->temp_count = item + 1;
                     break;
                 } // case
+                default:
+                {
+                    failf(ctx, "unknown operand type %d\n", operand->type);
+                    break;
+                }
             } // switch
 
             operand->index = item;
@@ -7466,7 +7539,6 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
 
         inst++;
     } // while
-#endif
 } // parse_preshader
 
 
@@ -8215,10 +8287,39 @@ static void process_definitions(Context *ctx)
                         return;
                     } // if
 
+                    //find the usage
+                    //hack copypastad from emit_GLSL_attribute
+                    MOJOSHADER_usage usage = MOJOSHADER_USAGE_UNKNOWN;
+                    if (regtype == REG_TYPE_RASTOUT)
+                    {
+                        switch ((const RastOutType) regnum)
+                        {
+                            case RASTOUT_TYPE_POSITION:
+                                usage = MOJOSHADER_USAGE_POSITION;
+                                break;
+                            case RASTOUT_TYPE_FOG:
+                                usage = MOJOSHADER_USAGE_FOG;
+                                break;
+                            case RASTOUT_TYPE_POINT_SIZE:
+                                usage = MOJOSHADER_USAGE_POINTSIZE;
+                                break;
+                        } // switch
+                    } // if
+
+                    else if (regtype == REG_TYPE_ATTROUT)
+                    {
+                        usage = MOJOSHADER_USAGE_COLOR;
+                    } // else if
+
+                    else if (regtype == REG_TYPE_TEXCRDOUT)
+                    {
+                        usage = MOJOSHADER_USAGE_TEXCOORD;
+                    } // else if
+
                     // Apparently this is an attribute that wasn't DCL'd.
                     //  Add it to the attribute list; deal with it later.
                     add_attribute_register(ctx, item->regtype, item->regnum,
-                                           MOJOSHADER_USAGE_UNKNOWN, 0, 0xF, 0);
+                                           usage, 0, 0xF, 0);
                     break;
 
                 case REG_TYPE_ADDRESS:
@@ -8342,6 +8443,26 @@ static void verify_swizzles(Context *ctx)
     } // for
 } // verify_swizzles
 
+const MOJOSHADER_parseData *MOJOSHADER_parseExpression(const unsigned char *tokenbuf,
+                                      const unsigned int bufsize,
+                                      MOJOSHADER_malloc m,
+                                      MOJOSHADER_free f, void *d)
+{
+    MOJOSHADER_parseData *retval;
+    Context *ctx = NULL;
+    if ( ((m == NULL) && (f != NULL)) || ((m != NULL) && (f == NULL)) )
+        return NULL;  // supply both or neither.
+
+    ctx = build_context("glsl120", tokenbuf, bufsize, NULL, 0, m, f, d);
+    if (ctx == NULL)
+        return NULL;
+    
+    parse_preshader(ctx, bufsize/4-1);
+    retval = build_parsedata(ctx);
+    destroy_context(ctx);
+    
+    return retval;
+}
 
 // API entry point...
 

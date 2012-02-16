@@ -24,7 +24,7 @@
     (DEBUG_PREPROCESSOR || DEBUG_ASSEMBLER_PARSER || DEBUG_LEXER)
 
 #if (defined(__APPLE__) && defined(__MACH__))
-#define PLATFORM_MACOSX 1
+//#define PLATFORM_MACOSX 1
 #endif
 
 // This is the highest shader version we currently support.
@@ -73,15 +73,6 @@
 
 // This removes the preshader parsing and execution code. You can save some
 //  bytes if you have normal shaders and not Effect files.
-#ifndef SUPPORT_PRESHADERS
-#define SUPPORT_PRESHADERS 1
-#endif
-
-#if SUPPORT_PRESHADERS
-void MOJOSHADER_runPreshader(const MOJOSHADER_preshader*, const float*, float*);
-#else
-#define MOJOSHADER_runPreshader(a, b)
-#endif
 
 
 // Get basic wankery out of the way here...

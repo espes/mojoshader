@@ -12,7 +12,6 @@
 
 #include <math.h>
 
-#if SUPPORT_PRESHADERS
 void MOJOSHADER_runPreshader(const MOJOSHADER_preshader *preshader,
                              const float *inregs, float *outregs)
 {
@@ -51,7 +50,7 @@ void MOJOSHADER_runPreshader(const MOJOSHADER_preshader *preshader,
         for (opiter = 0; opiter < inst->operand_count-1; opiter++, operand++)
         {
             const int isscalar = ((isscalarop) && (opiter == 0));
-            const unsigned int index = operand->index;
+            unsigned int index = operand->index;
             switch (operand->type)
             {
                 case MOJOSHADER_PRESHADEROPERAND_LITERAL:
@@ -70,6 +69,9 @@ void MOJOSHADER_runPreshader(const MOJOSHADER_preshader *preshader,
                 } // case
 
                 case MOJOSHADER_PRESHADEROPERAND_INPUT:
+                    if (operand->indexingType == 2) {
+                        index = index+inregs[operand->indexingIndex]*4;
+                    }
                     if (isscalar)
                         src[opiter][0] = inregs[index];
                     else
@@ -181,7 +183,6 @@ void MOJOSHADER_runPreshader(const MOJOSHADER_preshader *preshader,
         } // else
     } // for
 } // MOJOSHADER_runPreshader
-#endif
 
 static MOJOSHADER_effect MOJOSHADER_out_of_mem_effect = {
     1, &MOJOSHADER_out_of_mem_error, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0

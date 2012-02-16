@@ -397,16 +397,19 @@ typedef enum MOJOSHADER_preshaderOpcode
 
 typedef enum MOJOSHADER_preshaderOperandType
 {
-    MOJOSHADER_PRESHADEROPERAND_INPUT,
-    MOJOSHADER_PRESHADEROPERAND_OUTPUT,
-    MOJOSHADER_PRESHADEROPERAND_LITERAL,
-    MOJOSHADER_PRESHADEROPERAND_TEMP,
+	MOJOSHADER_PRESHADEROPERAND_LITERAL = 1,
+	MOJOSHADER_PRESHADEROPERAND_INPUT = 2,
+	MOJOSHADER_PRESHADEROPERAND_OUTPUT = 4,
+	MOJOSHADER_PRESHADEROPERAND_TEMP = 7,
+    MOJOSHADER_PRESHADEROPERAND_UNKN = 0xff,
 } MOJOSHADER_preshaderOperandType;
 
 typedef struct MOJOSHADER_preshaderOperand
 {
     MOJOSHADER_preshaderOperandType type;
     unsigned int index;
+	int indexingType;
+	unsigned int indexingIndex;
 } MOJOSHADER_preshaderOperand;
 
 typedef struct MOJOSHADER_preshaderInstruction
@@ -414,7 +417,7 @@ typedef struct MOJOSHADER_preshaderInstruction
     MOJOSHADER_preshaderOpcode opcode;
     unsigned int element_count;
     unsigned int operand_count;
-    MOJOSHADER_preshaderOperand operands[3];
+    MOJOSHADER_preshaderOperand operands[4];
 } MOJOSHADER_preshaderInstruction;
 
 typedef struct MOJOSHADER_preshader
@@ -657,6 +660,13 @@ typedef struct MOJOSHADER_parseData
  */
 int MOJOSHADER_maxShaderModel(const char *profile);
 
+const MOJOSHADER_parseData *MOJOSHADER_parseExpression(const unsigned char *tokenbuf,
+                                      const unsigned int bufsize,
+                                      MOJOSHADER_malloc m,
+									  MOJOSHADER_free f, void *d);
+
+
+void MOJOSHADER_runPreshader(const MOJOSHADER_preshader*, const float*, float*);
 
 /*
  * Parse a compiled Direct3D shader's bytecode.

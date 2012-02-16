@@ -3,6 +3,77 @@ PROJECT(MojoShader)
 
 INCLUDE_DIRECTORIES(.)
 
+#SET (CMAKE_OSX_ARCHITECTURES "i386" "x86_64")
+#ADD_DEFINITIONS("-arch i386")
+#ADD_DEFINITIONS("-arch x86_64")
+
+set(CMAKE_BUILD_TYPE Release)
+
+SET(IOSSIM "rah")
+
+IF(IOS)
+    SET (CMAKE_SYSTEM_PROCESSOR arm)
+    SET (SDKVER "5.0")
+    SET (DEVROOT "/Developer/Platforms/iPhoneOS.platform/Developer")
+    SET (SDKROOT "${DEVROOT}/SDKs/iPhoneOS${SDKVER}.sdk")
+    SET (CMAKE_OSX_SYSROOT "${SDKROOT}")
+    SET (CMAKE_OSX_ARCHITECTURES "armv6" "armv7")
+
+    SET (CMAKE_C_COMPILER "${DEVROOT}/usr/bin/gcc")
+    SET (CMAKE_CXX_COMPILER "${DEVROOT}/usr/bin/g++")
+
+    ADD_DEFINITIONS("-std=c99")
+    ADD_DEFINITIONS("-arch armv6")
+    ADD_DEFINITIONS("-arch armv7")
+    ADD_DEFINITIONS("-pipe")
+    ADD_DEFINITIONS("-no-cpp-precomp")
+    ADD_DEFINITIONS("--sysroot=${SDKROOT}")
+    ADD_DEFINITIONS("-miphoneos-version-min=${SDKVER}")
+
+    INCLUDE_DIRECTORIES(SYSTEM "${SDKROOT}/usr/include")
+
+    LINK_DIRECTORIES("${SDKROOT}/usr/lib")
+
+    SET (CMAKE_FIND_ROOT_PATH "${SDKROOT}")
+    SET (CMAKE_FIND_ROOT_PATH_MODE_PROGRAM BOTH)
+    SET (CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+    SET (CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+ENDIF(IOS)
+
+IF(IOSSIM)
+    SET (CMAKE_SYSTEM_PROCESSOR i686)
+    SET_PROPERTY(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
+
+    SET (SDKVER "5.0")
+    SET (DEVROOT "/Developer/Platforms/iPhoneSimulator.platform/Developer")
+    SET (SDKROOT "${DEVROOT}/SDKs/iPhoneSimulator${SDKVER}.sdk")
+    SET (CMAKE_OSX_SYSROOT "${SDKROOT}")
+    SET (CMAKE_OSX_ARCHITECTURES "i386" "x86_64")
+
+    SET (CMAKE_C_COMPILER "${DEVROOT}/usr/bin/gcc")
+    SET (CMAKE_CXX_COMPILER "${DEVROOT}/usr/bin/g++")
+
+    ADD_DEFINITIONS("-std=c99")
+    ADD_DEFINITIONS("-arch i386")
+    ADD_DEFINITIONS("-arch x86_64")
+    ADD_DEFINITIONS("-pipe")
+    ADD_DEFINITIONS("-no-cpp-precomp")
+    ADD_DEFINITIONS("--sysroot=${SDKROOT}")
+    ADD_DEFINITIONS("-miphoneos-version-min=${SDKVER}")
+
+    INCLUDE_DIRECTORIES(SYSTEM "${SDKROOT}/usr/include")
+
+    LINK_DIRECTORIES("${SDKROOT}/usr/lib")
+
+    SET (CMAKE_FIND_ROOT_PATH "${SDKROOT}")
+    SET (CMAKE_FIND_ROOT_PATH_MODE_PROGRAM BOTH)
+    SET (CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+    SET (CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+ENDIF(IOSSIM)
+
+
+
+
 FIND_PROGRAM(HG hg DOC "Path to hg command line app: http://www.selenic.com/mercurial/")
 IF(NOT HG)
     MESSAGE(STATUS "Mercurial (hg) not found. You can go on, but version info will be wrong.")
@@ -39,7 +110,7 @@ WRITE_FILE(
 )
 
 IF(CMAKE_COMPILER_IS_GNUCC)
-    ADD_DEFINITIONS(-Wall -ggdb3)
+    ADD_DEFINITIONS(-Wall) #-ggdb3
 ENDIF(CMAKE_COMPILER_IS_GNUCC)
 
 # testparse uses this when I'm looking at memory usage patterns.
@@ -51,15 +122,17 @@ IF(MSVC)
 ENDIF(MSVC)
 
 # We build lemon, then use it to generate parser C code.
-ADD_EXECUTABLE(lemon "misc/lemon.c")
-GET_TARGET_PROPERTY(LEMON lemon LOCATION)
-ADD_CUSTOM_COMMAND(
-    OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/mojoshader_parser_hlsl.h"
-    MAIN_DEPENDENCY "${CMAKE_CURRENT_SOURCE_DIR}/mojoshader_parser_hlsl.lemon"
-    DEPENDS lemon "${CMAKE_CURRENT_SOURCE_DIR}/misc/lempar.c"
-    COMMAND "${LEMON}"
-    ARGS -q "-T${CMAKE_CURRENT_SOURCE_DIR}/misc/lempar.c" "${CMAKE_CURRENT_SOURCE_DIR}/mojoshader_parser_hlsl.lemon"
-)
+IF(NOT IOS AND NOT IOSSIM)
+    ADD_EXECUTABLE(lemon "misc/lemon.c")
+    GET_TARGET_PROPERTY(LEMON lemon LOCATION)
+    ADD_CUSTOM_COMMAND(
+        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/mojoshader_parser_hlsl.h"
+        MAIN_DEPENDENCY "${CMAKE_CURRENT_SOURCE_DIR}/mojoshader_parser_hlsl.lemon"
+        DEPENDS lemon "${CMAKE_CURRENT_SOURCE_DIR}/misc/lempar.c"
+        COMMAND "${LEMON}"
+        ARGS -q "-T${CMAKE_CURRENT_SOURCE_DIR}/misc/lempar.c" "${CMAKE_CURRENT_SOURCE_DIR}/mojoshader_parser_hlsl.lemon"
+    )
+ENDIF(NOT IOS AND NOT IOSSIM)
 
 ADD_LIBRARY(mojoshader STATIC
     mojoshader.c
