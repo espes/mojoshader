@@ -678,7 +678,11 @@ static int parse_source_token_maybe_relative(Context *ctx, const int relok)
             set_source_mod(ctx, negate, SRCMOD_X2, SRCMOD_X2NEGATE, &srcmod);
         else if (check_token_segment(ctx, "_dz"))
             set_source_mod(ctx, negate, SRCMOD_DZ, SRCMOD_NONE, &srcmod);
+        else if (check_token_segment(ctx, "_db"))
+            set_source_mod(ctx, negate, SRCMOD_DZ, SRCMOD_NONE, &srcmod);
         else if (check_token_segment(ctx, "_dw"))
+            set_source_mod(ctx, negate, SRCMOD_DW, SRCMOD_NONE, &srcmod);
+        else if (check_token_segment(ctx, "_da"))
             set_source_mod(ctx, negate, SRCMOD_DW, SRCMOD_NONE, &srcmod);
         else if (check_token_segment(ctx, "_abs"))
             set_source_mod(ctx, negate, SRCMOD_ABS, SRCMOD_ABSNEGATE, &srcmod);
@@ -1667,7 +1671,7 @@ static const MOJOSHADER_parseData *build_final_assembly(Context *ctx)
     //  like setting up the uniforms list, etc.
     MOJOSHADER_parseData *retval = (MOJOSHADER_parseData *)
                             MOJOSHADER_parse(MOJOSHADER_PROFILE_BYTECODE,
-                                    bytecode, output_len, NULL, 0,
+                                    bytecode, output_len, NULL, 0, NULL, 0,
                                     ctx->malloc, ctx->free, ctx->malloc_data);
     Free(ctx, bytecode);
 

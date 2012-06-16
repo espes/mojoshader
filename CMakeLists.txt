@@ -3,13 +3,13 @@ PROJECT(MojoShader)
 
 INCLUDE_DIRECTORIES(.)
 
-#SET (CMAKE_OSX_ARCHITECTURES "i386" "x86_64")
-#ADD_DEFINITIONS("-arch i386")
-#ADD_DEFINITIONS("-arch x86_64")
+SET (CMAKE_OSX_ARCHITECTURES "i386" "x86_64")
+ADD_DEFINITIONS("-arch i386")
+ADD_DEFINITIONS("-arch x86_64")
 
 set(CMAKE_BUILD_TYPE Release)
 
-SET(IOSSIM "rah")
+#SET(IOSSIM "rah")
 
 IF(IOS)
     SET (CMAKE_SYSTEM_PROCESSOR arm)
@@ -134,16 +134,31 @@ IF(NOT IOS AND NOT IOSSIM)
     )
 ENDIF(NOT IOS AND NOT IOSSIM)
 
-ADD_LIBRARY(mojoshader STATIC
-    mojoshader.c
-    mojoshader_common.c
-    mojoshader_effects.c
-    mojoshader_compiler.c
-    mojoshader_preprocessor.c
-    mojoshader_lexer.c
-    mojoshader_assembler.c
-    mojoshader_opengl.c
-)
+IF(IOS OR IOSSIM)
+    ADD_LIBRARY(mojoshader STATIC
+        mojoshader.c
+        mojoshader_common.c
+        mojoshader_effects.c
+        mojoshader_compiler.c
+        mojoshader_preprocessor.c
+        mojoshader_lexer.c
+        mojoshader_assembler.c
+        mojoshader_opengl.c
+    )
+ELSE(IOS OR IOSSIM)
+    ADD_LIBRARY(mojoshader SHARED
+        mojoshader.c
+        mojoshader_common.c
+        mojoshader_effects.c
+        mojoshader_compiler.c
+        mojoshader_preprocessor.c
+        mojoshader_lexer.c
+        mojoshader_assembler.c
+        mojoshader_opengl.c
+    )
+ENDIF(IOS OR IOSSIM)
+
+
 
 IF(UNIX)
     SET(LIBM -lm)

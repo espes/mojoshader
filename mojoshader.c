@@ -10,6 +10,11 @@
 // !!! FIXME: this file really needs to be split up.
 // !!! FIXME: I keep changing coding styles for symbols and typedefs.
 
+// !!! FIXME: rules from MSDN about temp registers we probably don't check.
+// - There are limited temporaries: vs_1_1 has 12 (ps_1_1 has _2_!).
+// - SM2 apparently was variable, between 12 and 32. Shader Model 3 has 32.
+// - A maximum of three temp registers can be used in a single instruction.
+
 #define __MOJOSHADER_INTERNAL__ 1
 #include "mojoshader_internal.h"
 
@@ -38,6 +43,7 @@ typedef struct RegisterList
     unsigned int index;
     int writemask;
     int misc;
+    int written;
     const VariableList *array;
     struct RegisterList *next;
 } RegisterList;
@@ -83,6 +89,8 @@ typedef struct Context
     uint32 tokencount;
     const MOJOSHADER_swizzle *swizzles;
     unsigned int swizzles_count;
+    const MOJOSHADER_samplerMap *samplermap;
+    unsigned int samplermap_count;
     Buffer *output;
     Buffer *preflight;
     Buffer *globals;
@@ -111,6 +119,7 @@ typedef struct Context
     int instruction_count;
     uint32 instruction_controls;
     uint32 previous_opcode;
+    int coissue;
     int loops;
     int reps;
     int max_reps;
@@ -144,11 +153,20 @@ typedef struct Context
     int determined_constants_arrays;
     int predicated;
     int uses_pointsize;
-    int glsl_generated_lit_opcode;
+    int uses_fog;
+    int glsl_generated_lit_helper;
     int glsl_generated_texldd_setup;
+    int glsl_generated_texm3x3spec_helper;
     int arb1_wrote_position;
     int have_preshader;
     int ignores_ctab;
+    int reset_texmpad;
+    int texm3x2pad_dst0;
+    int texm3x2pad_src0;
+    int texm3x3pad_dst0;
+    int texm3x3pad_src0;
+    int texm3x3pad_dst1;
+    int texm3x3pad_src1;
     MOJOSHADER_preshader *preshader;
 
 #if SUPPORT_PROFILE_ARB1_NV
@@ -213,7 +231,8 @@ typedef void (*emit_uniform)(Context *ctx, RegisterType regtype, int regnum,
                              const VariableList *var);
 
 // one emit function for samplers in each profile.
-typedef void (*emit_sampler)(Context *ctx, int stage, TextureType ttype);
+typedef void (*emit_sampler)(Context *ctx, int stage, TextureType ttype,
+                             int texbem);
 
 // one emit function for attributes in each profile.
 typedef void (*emit_attribute)(Context *ctx, RegisterType regtype, int regnum,
@@ -470,6 +489,16 @@ static void floatstr(Context *ctx, char *buf, size_t bufsize, float f,
     } // else
 } // floatstr
 
+static inline TextureType cvtMojoToD3DSamplerType(const MOJOSHADER_samplerType type)
+{
+    return (TextureType) (((int) type) + 2);
+} // cvtMojoToD3DSamplerType
+
+static inline MOJOSHADER_samplerType cvtD3DToMojoSamplerType(const TextureType type)
+{
+    return (MOJOSHADER_samplerType) (((int) type) - 2);
+} // cvtD3DToMojoSamplerType
+
 
 // Deal with register lists...  !!! FIXME: I sort of hate this.
 
@@ -554,12 +583,26 @@ static inline const RegisterList *reglist_exists(RegisterList *prev,
     return (reglist_find(prev, regtype, regnum));
 } // reglist_exists
 
-static inline void set_used_register(Context *ctx, const RegisterType regtype,
-                                     const int regnum)
+static inline int register_was_written(Context *ctx, const RegisterType rtype,
+                                       const int regnum)
 {
+    RegisterList *reg = reglist_find(&ctx->used_registers, rtype, regnum);
+    return (reg && reg->written);
+} // register_was_written
+
+static inline RegisterList *set_used_register(Context *ctx,
+                                              const RegisterType regtype,
+                                              const int regnum,
+                                              const int written)
+{
+    RegisterList *reg = NULL;
     if ((regtype == REG_TYPE_COLOROUT) && (regnum > 0))
         ctx->have_multi_color_outputs = 1;
-    reglist_insert(ctx, &ctx->used_registers, regtype, regnum);
+
+    reg = reglist_insert(ctx, &ctx->used_registers, regtype, regnum);
+    if (reg && written)
+        reg->written = 1;
+    return reg;
 } // set_used_register
 
 static inline int get_used_register(Context *ctx, const RegisterType regtype,
@@ -592,14 +635,34 @@ static void add_attribute_register(Context *ctx, const RegisterType rtype,
 
     if ((rtype == REG_TYPE_OUTPUT) && (usage == MOJOSHADER_USAGE_POINTSIZE))
         ctx->uses_pointsize = 1;  // note that we have to check this later.
+    else if ((rtype == REG_TYPE_OUTPUT) && (usage == MOJOSHADER_USAGE_FOG))
+        ctx->uses_fog = 1;  // note that we have to check this later.
 } // add_attribute_register
 
-static inline void add_sampler(Context *ctx, const RegisterType rtype,
-                               const int regnum, const TextureType ttype)
+static inline void add_sampler(Context *ctx, const int regnum,
+                               TextureType ttype, const int texbem)
 {
+    const RegisterType rtype = REG_TYPE_SAMPLER;
+
     // !!! FIXME: make sure it doesn't exist?
+    // !!! FIXME:  (ps_1_1 assume we can add it multiple times...)
     RegisterList *item = reglist_insert(ctx, &ctx->samplers, rtype, regnum);
+
+    if (ctx->samplermap != NULL)
+    {
+        unsigned int i;
+        for (i = 0; i < ctx->samplermap_count; i++)
+        {
+            if (ctx->samplermap[i].index == regnum)
+            {
+                ttype = cvtMojoToD3DSamplerType(ctx->samplermap[i].type);
+                break;
+            } // if
+        } // for
+    } // if
+
     item->index = (int) ttype;
+    item->misc |= texbem;
 } // add_sampler
 
 
@@ -652,6 +715,17 @@ static inline int vecsize_from_writemask(const int m)
     return (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1);
 } // vecsize_from_writemask
 
+
+static inline void set_dstarg_writemask(DestArgInfo *dst, const int mask)
+{
+    dst->writemask = mask;
+    dst->writemask0 = ((mask >> 0) & 1);
+    dst->writemask1 = ((mask >> 1) & 1);
+    dst->writemask2 = ((mask >> 2) & 1);
+    dst->writemask3 = ((mask >> 3) & 1);
+} // set_dstarg_writemask
+
+
 static int allocate_scratch_register(Context *ctx)
 {
     const int retval = ctx->scratch_registers++;
@@ -678,11 +752,17 @@ static inline void adjust_token_position(Context *ctx, const int incr)
 static int isscalar(Context *ctx, const MOJOSHADER_shaderType shader_type,
                     const RegisterType rtype, const int rnum)
 {
-    if ((rtype == REG_TYPE_OUTPUT) && (ctx->uses_pointsize))
+    const int uses_psize = ctx->uses_pointsize;
+    const int uses_fog = ctx->uses_fog;
+    if ( (rtype == REG_TYPE_OUTPUT) && ((uses_psize) || (uses_fog)) )
     {
         const RegisterList *reg = reglist_find(&ctx->attributes, rtype, rnum);
         if (reg != NULL)
-            return (reg->usage == MOJOSHADER_USAGE_POINTSIZE);
+        {
+            const MOJOSHADER_usage usage = reg->usage;
+            return ( (uses_psize && (usage == MOJOSHADER_USAGE_POINTSIZE)) ||
+                     (uses_fog && (usage == MOJOSHADER_USAGE_FOG)) );
+        } // if
     } // if
 
     return scalar_register(shader_type, rtype, rnum);
@@ -1113,7 +1193,7 @@ static void emit_D3D_uniform(Context *ctx, RegisterType regtype, int regnum,
 } // emit_D3D_uniform
 
 
-static void emit_D3D_sampler(Context *ctx, int stage, TextureType ttype)
+static void emit_D3D_sampler(Context *ctx, int s, TextureType ttype, int tb)
 {
     // no-op.
 } // emit_D3D_sampler
@@ -1152,7 +1232,7 @@ static void emit_D3D_opcode_d(Context *ctx, const char *opcode)
 {
     char dst[64]; make_D3D_destarg_string(ctx, dst, sizeof (dst));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s%s", opcode, dst);
+    output_line(ctx, "%s%s%s", ctx->coissue ? "+" : "", opcode, dst);
 } // emit_D3D_opcode_d
 
 
@@ -1160,7 +1240,7 @@ static void emit_D3D_opcode_s(Context *ctx, const char *opcode)
 {
     char src0[64]; make_D3D_srcarg_string(ctx, 0, src0, sizeof (src0));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s %s", opcode, src0);
+    output_line(ctx, "%s%s %s", ctx->coissue ? "+" : "", opcode, src0);
 } // emit_D3D_opcode_s
 
 
@@ -1169,7 +1249,7 @@ static void emit_D3D_opcode_ss(Context *ctx, const char *opcode)
     char src0[64]; make_D3D_srcarg_string(ctx, 0, src0, sizeof (src0));
     char src1[64]; make_D3D_srcarg_string(ctx, 1, src1, sizeof (src1));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s %s, %s", opcode, src0, src1);
+    output_line(ctx, "%s%s %s, %s", ctx->coissue ? "+" : "", opcode, src0, src1);
 } // emit_D3D_opcode_ss
 
 
@@ -1178,7 +1258,7 @@ static void emit_D3D_opcode_ds(Context *ctx, const char *opcode)
     char dst[64]; make_D3D_destarg_string(ctx, dst, sizeof (dst));
     char src0[64]; make_D3D_srcarg_string(ctx, 0, src0, sizeof (src0));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s%s, %s", opcode, dst, src0);
+    output_line(ctx, "%s%s%s, %s", ctx->coissue ? "+" : "", opcode, dst, src0);
 } // emit_D3D_opcode_ds
 
 
@@ -1188,7 +1268,8 @@ static void emit_D3D_opcode_dss(Context *ctx, const char *opcode)
     char src0[64]; make_D3D_srcarg_string(ctx, 0, src0, sizeof (src0));
     char src1[64]; make_D3D_srcarg_string(ctx, 1, src1, sizeof (src1));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s%s, %s, %s", opcode, dst, src0, src1);
+    output_line(ctx, "%s%s%s, %s, %s", ctx->coissue ? "+" : "",
+                opcode, dst, src0, src1);
 } // emit_D3D_opcode_dss
 
 
@@ -1199,7 +1280,8 @@ static void emit_D3D_opcode_dsss(Context *ctx, const char *opcode)
     char src1[64]; make_D3D_srcarg_string(ctx, 1, src1, sizeof (src1));
     char src2[64]; make_D3D_srcarg_string(ctx, 2, src2, sizeof (src2));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s%s, %s, %s, %s", opcode, dst, src0, src1, src2);
+    output_line(ctx, "%s%s%s, %s, %s, %s", ctx->coissue ? "+" : "", 
+                opcode, dst, src0, src1, src2);
 } // emit_D3D_opcode_dsss
 
 
@@ -1211,15 +1293,16 @@ static void emit_D3D_opcode_dssss(Context *ctx, const char *opcode)
     char src2[64]; make_D3D_srcarg_string(ctx, 2, src2, sizeof (src2));
     char src3[64]; make_D3D_srcarg_string(ctx, 3, src3, sizeof (src3));
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx,"%s%s, %s, %s, %s, %s",opcode,dst,src0,src1,src2,src3);
+    output_line(ctx,"%s%s%s, %s, %s, %s, %s", ctx->coissue ? "+" : "",
+                opcode, dst, src0, src1, src2, src3);
 } // emit_D3D_opcode_dssss
 
 
 static void emit_D3D_opcode(Context *ctx, const char *opcode)
 {
     opcode = lowercase((char *) alloca(strlen(opcode) + 1), opcode);
-    output_line(ctx, "%s", opcode);
-} // emit_D3D_opcode_dssss
+    output_line(ctx, "%s%s", ctx->coissue ? "+" : "", opcode);
+} // emit_D3D_opcode
 
 
 #define EMIT_D3D_OPCODE_FUNC(op) \
@@ -1520,7 +1603,7 @@ static void emit_BYTECODE_phase(Context *ctx) {}
 static void emit_BYTECODE_finalize(Context *ctx) {}
 static void emit_BYTECODE_global(Context *ctx, RegisterType t, int n) {}
 static void emit_BYTECODE_array(Context *ctx, VariableList *var) {}
-static void emit_BYTECODE_sampler(Context *ctx, int s, TextureType ttype) {}
+static void emit_BYTECODE_sampler(Context *c, int s, TextureType t, int tb) {}
 static void emit_BYTECODE_const_array(Context *ctx, const ConstantsList *c,
                                          int base, int size) {}
 static void emit_BYTECODE_uniform(Context *ctx, RegisterType t, int n,
@@ -1791,7 +1874,7 @@ static const char *make_GLSL_destarg_assign(Context *ctx, char *buf,
         return buf;
     } // if
 
-    char operation[128];
+    char operation[256];
     va_list ap;
     va_start(ap, fmt);
     const int len = vsnprintf(operation, sizeof (operation), fmt, ap);
@@ -1885,7 +1968,6 @@ static const char *make_GLSL_srcarg_string(Context *ctx, const size_t idx,
         return buf;
     } // if
 
-// !!! FIXME: not right.
     const SourceArgInfo *arg = &ctx->source_args[idx];
 
     const char *premod_str = "";
@@ -1897,35 +1979,36 @@ static const char *make_GLSL_srcarg_string(Context *ctx, const size_t idx,
             break;
 
         case SRCMOD_BIASNEGATE:
-            premod_str = "-";
-            // fall through.
+            premod_str = "-(";
+            postmod_str = " - 0.5)";
+            break;
+
         case SRCMOD_BIAS:
-            fail(ctx, "SRCMOD_BIAS unsupported"); return buf; // !!! FIXME
-            postmod_str = "_bias";
+            premod_str = "(";
+            postmod_str = " - 0.5)";
             break;
 
         case SRCMOD_SIGNNEGATE:
-            premod_str = "-";
-            // fall through.
+            premod_str = "-((";
+            postmod_str = " - 0.5) * 2.0)";
+            break;
+
         case SRCMOD_SIGN:
-            fail(ctx, "SRCMOD_SIGN unsupported"); return buf; // !!! FIXME
-            postmod_str = "_bx2";
+            premod_str = "((";
+            postmod_str = " - 0.5) * 2.0)";
             break;
 
         case SRCMOD_COMPLEMENT:
-            fail(ctx, "SRCMOD_COMPLEMENT unsupported"); return buf; // !!! FIXME  (need to handle vecsize)
-            premod_str = "(1.0 - (";
-            postmod_str = "))";
+            premod_str = "(1.0 - ";
+            postmod_str = ")";
             break;
 
         case SRCMOD_X2NEGATE:
-            fail(ctx, "SRCMOD_X2NEGATE unsupported"); return buf; // !!! FIXME  (need to handle vecsize)
             premod_str = "-(";
             postmod_str = " * 2.0)";
             break;
 
         case SRCMOD_X2:
-            fail(ctx, "SRCMOD_X2 unsupported"); return buf; // !!! FIXME  (need to handle vecsize)
             premod_str = "(";
             postmod_str = " * 2.0)";
             break;
@@ -2133,7 +2216,16 @@ static void emit_GLSL_start(Context *ctx, const char *profilestr)
 static void emit_GLSL_RET(Context *ctx);
 static void emit_GLSL_end(Context *ctx)
 {
-    
+    // ps_1_* writes color to r0 instead oC0. We move it to the right place.
+    // We don't have to worry about a RET opcode messing this up, since
+    //  RET isn't available before ps_2_0.
+    if (shader_is_pixel(ctx) && !shader_version_atleast(ctx, 2, 0))
+    {
+        const char *shstr = ctx->shader_type_str;
+        set_used_register(ctx, REG_TYPE_COLOROUT, 0, 1);
+        output_line(ctx, "%s_oC0 = %s_r0;", shstr, shstr);
+    } // if
+
     if (ctx->shader_type == MOJOSHADER_TYPE_VERTEX) {
         //fix the opengl/directx coord mapping
         //see wine glsl_shader.c for details
@@ -2142,7 +2234,7 @@ static void emit_GLSL_end(Context *ctx)
         output_line(ctx, "gl_Position.xy += posFixup.zw * gl_Position.ww;");
         //output_line(ctx, "gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;");
     }
-    
+
     // force a RET opcode if we're at the end of the stream without one.
     if (ctx->previous_opcode != OPCODE_RET)
         emit_GLSL_RET(ctx);
@@ -2200,7 +2292,19 @@ static void emit_GLSL_global(Context *ctx, RegisterType regtype, int regnum)
     switch (regtype)
     {
         case REG_TYPE_ADDRESS:
-            output_line(ctx, "ivec4 %s;", varname);
+            if (shader_is_vertex(ctx))
+                output_line(ctx, "ivec4 %s;", varname);
+            else if (shader_is_pixel(ctx))  // actually REG_TYPE_TEXTURE.
+            {
+                // We have to map texture registers to temps for ps_1_1, since
+                //  they work like temps, initialize with tex coords, and the
+                //  ps_1_1 TEX opcode expects to overwrite it.
+                if (!shader_version_atleast(ctx, 1, 4))
+                {
+                    output_line(ctx, "vec4 %s = gl_TexCoord[%d];",
+                                varname, regnum);
+                } // if
+            } // else if
             break;
         case REG_TYPE_PREDICATE:
             output_line(ctx, "bvec4 %s;", varname);
@@ -2344,7 +2448,7 @@ static void emit_GLSL_uniform(Context *ctx, RegisterType regtype, int regnum,
     pop_output(ctx);
 } // emit_GLSL_uniform
 
-static void emit_GLSL_sampler(Context *ctx, int stage, TextureType ttype)
+static void emit_GLSL_sampler(Context *ctx,int stage,TextureType ttype,int tb)
 {
     const char *type = "";
     switch (ttype)
@@ -2360,6 +2464,15 @@ static void emit_GLSL_sampler(Context *ctx, int stage, TextureType ttype)
 
     push_output(ctx, &ctx->globals);
     output_line(ctx, "uniform %s %s;", type, var);
+    if (tb)  // This sampler used a ps_1_1 TEXBEM opcode?
+    {
+        char name[64];
+        const int index = ctx->uniform_float4_count;
+        ctx->uniform_float4_count += 2;
+        get_GLSL_uniform_array_varname(ctx, REG_TYPE_CONST, name, sizeof (name));
+        output_line(ctx, "#define %s_texbem %s[%d]", var, name, index);
+        output_line(ctx, "#define %s_texbeml %s[%d]", var, name, index+1);
+    } // if
     pop_output(ctx);
 } // emit_GLSL_sampler
 
@@ -2533,12 +2646,17 @@ static void emit_GLSL_attribute(Context *ctx, RegisterType regtype, int regnum,
             push_output(ctx, &ctx->globals);
             if (usage == MOJOSHADER_USAGE_TEXCOORD)
             {
-                snprintf(index_str, sizeof (index_str), "%u", (uint) index);
-                output_line(ctx, "varying vec4 vTexCoord%s;", index_str);
-                output_line(ctx, "#define %s vTexCoord%s", var, index_str);
-                //usage_str = "gl_TexCoord";
-                //arrayleft = "[";
-                //arrayright = "]";
+                // ps_1_1 does a different hack for this attribute.
+                //  Refer to emit_GLSL_global()'s REG_TYPE_TEXTURE code.
+                if (shader_version_atleast(ctx, 1, 4))
+                {
+                    snprintf(index_str, sizeof (index_str), "%u", (uint) index);
+                    output_line(ctx, "varying vec4 vTexCoord%s;", index_str);
+                    output_line(ctx, "#define %s vTexCoord%s", var, index_str);
+                    //usage_str = "gl_TexCoord";
+                    //arrayleft = "[";
+                    //arrayright = "]";
+                } // if
             } // if
 
             else if (usage == MOJOSHADER_USAGE_COLOR)
@@ -2774,18 +2892,18 @@ static void emit_GLSL_LOG(Context *ctx)
 
 static void emit_GLSL_LIT_helper(Context *ctx)
 {
-    const char *maxp = "127.9961f"; // value from the dx9 reference.
+    const char *maxp = "127.9961"; // value from the dx9 reference.
 
-    if (ctx->glsl_generated_lit_opcode)
+    if (ctx->glsl_generated_lit_helper)
         return;
 
-    ctx->glsl_generated_lit_opcode = 1;
+    ctx->glsl_generated_lit_helper = 1;
 
     push_output(ctx, &ctx->helpers);
-    output_line(ctx, "const vec4 LIT(const vec4 src)");
+    output_line(ctx, "vec4 LIT(const vec4 src)");
     output_line(ctx, "{"); ctx->indent++;
-    output_line(ctx,   "const float power = clamp(src.w, -%s, %s);",maxp,maxp);
-    output_line(ctx,   "vec4 retval(1.0, 0.0, 0.0, 1.0)");
+    output_line(ctx,   "float power = clamp(src.w, -%s, %s);",maxp,maxp);
+    output_line(ctx,   "vec4 retval = vec4(1.0, 0.0, 0.0, 1.0);");
     output_line(ctx,   "if (src.x > 0.0) {"); ctx->indent++;
     output_line(ctx,     "retval.y = src.x;");
     output_line(ctx,     "if (src.y > 0.0) {"); ctx->indent++;
@@ -2802,9 +2920,9 @@ static void emit_GLSL_LIT(Context *ctx)
 {
     char src0[64]; make_GLSL_srcarg_string_full(ctx, 0, src0, sizeof (src0));
     char code[128];
+    emit_GLSL_LIT_helper(ctx);
     make_GLSL_destarg_assign(ctx, code, sizeof (code), "LIT(%s)", src0);
     output_line(ctx, "%s", code);
-    emit_GLSL_LIT_helper(ctx);
 } // emit_GLSL_LIT
 
 static void emit_GLSL_DST(Context *ctx)
@@ -2843,13 +2961,12 @@ static void emit_GLSL_FRC(Context *ctx)
 
 static void emit_GLSL_M4X4(Context *ctx)
 {
-    // !!! FIXME: d3d is row-major, glsl is column-major, I think.
     char src0[64]; make_GLSL_srcarg_string_full(ctx, 0, src0, sizeof (src0));
     char row0[64]; make_GLSL_srcarg_string_full(ctx, 1, row0, sizeof (row0));
     char row1[64]; make_GLSL_srcarg_string_full(ctx, 2, row1, sizeof (row1));
     char row2[64]; make_GLSL_srcarg_string_full(ctx, 3, row2, sizeof (row2));
     char row3[64]; make_GLSL_srcarg_string_full(ctx, 4, row3, sizeof (row3));
-    char code[128];
+    char code[256];
     make_GLSL_destarg_assign(ctx, code, sizeof (code),
                     "vec4(dot(%s, %s), dot(%s, %s), dot(%s, %s), dot(%s, %s))",
                     src0, row0, src0, row1, src0, row2, src0, row3);
@@ -2858,12 +2975,11 @@ static void emit_GLSL_M4X4(Context *ctx)
 
 static void emit_GLSL_M4X3(Context *ctx)
 {
-    // !!! FIXME: d3d is row-major, glsl is column-major, I think.
     char src0[64]; make_GLSL_srcarg_string_full(ctx, 0, src0, sizeof (src0));
     char row0[64]; make_GLSL_srcarg_string_full(ctx, 1, row0, sizeof (row0));
     char row1[64]; make_GLSL_srcarg_string_full(ctx, 2, row1, sizeof (row1));
     char row2[64]; make_GLSL_srcarg_string_full(ctx, 3, row2, sizeof (row2));
-    char code[128];
+    char code[256];
     make_GLSL_destarg_assign(ctx, code, sizeof (code),
                                 "vec3(dot(%s, %s), dot(%s, %s), dot(%s, %s))",
                                 src0, row0, src0, row1, src0, row2);
@@ -2872,14 +2988,13 @@ static void emit_GLSL_M4X3(Context *ctx)
 
 static void emit_GLSL_M3X4(Context *ctx)
 {
-    // !!! FIXME: d3d is row-major, glsl is column-major, I think.
     char src0[64]; make_GLSL_srcarg_string_vec3(ctx, 0, src0, sizeof (src0));
     char row0[64]; make_GLSL_srcarg_string_vec3(ctx, 1, row0, sizeof (row0));
     char row1[64]; make_GLSL_srcarg_string_vec3(ctx, 2, row1, sizeof (row1));
     char row2[64]; make_GLSL_srcarg_string_vec3(ctx, 3, row2, sizeof (row2));
     char row3[64]; make_GLSL_srcarg_string_vec3(ctx, 4, row3, sizeof (row3));
 
-    char code[128];
+    char code[256];
     make_GLSL_destarg_assign(ctx, code, sizeof (code),
                                 "vec4(dot(%s, %s), dot(%s, %s), "
                                      "dot(%s, %s), dot(%s, %s))",
@@ -2890,12 +3005,11 @@ static void emit_GLSL_M3X4(Context *ctx)
 
 static void emit_GLSL_M3X3(Context *ctx)
 {
-    // !!! FIXME: d3d is row-major, glsl is column-major, I think.
     char src0[64]; make_GLSL_srcarg_string_vec3(ctx, 0, src0, sizeof (src0));
     char row0[64]; make_GLSL_srcarg_string_vec3(ctx, 1, row0, sizeof (row0));
     char row1[64]; make_GLSL_srcarg_string_vec3(ctx, 2, row1, sizeof (row1));
     char row2[64]; make_GLSL_srcarg_string_vec3(ctx, 3, row2, sizeof (row2));
-    char code[128];
+    char code[256];
     make_GLSL_destarg_assign(ctx, code, sizeof (code),
                                 "vec3(dot(%s, %s), dot(%s, %s), dot(%s, %s))",
                                 src0, row0, src0, row1, src0, row2);
@@ -2904,12 +3018,11 @@ static void emit_GLSL_M3X3(Context *ctx)
 
 static void emit_GLSL_M3X2(Context *ctx)
 {
-    // !!! FIXME: d3d is row-major, glsl is column-major, I think.
     char src0[64]; make_GLSL_srcarg_string_vec3(ctx, 0, src0, sizeof (src0));
     char row0[64]; make_GLSL_srcarg_string_vec3(ctx, 1, row0, sizeof (row0));
     char row1[64]; make_GLSL_srcarg_string_vec3(ctx, 2, row1, sizeof (row1));
 
-    char code[128];
+    char code[256];
     make_GLSL_destarg_assign(ctx, code, sizeof (code),
                                 "vec2(dot(%s, %s), dot(%s, %s))",
                                 src0, row0, src0, row1);
@@ -3179,14 +3292,56 @@ static void emit_GLSL_TEXKILL(Context *ctx)
 
 static void glsl_texld(Context *ctx, const int texldd)
 {
-    // !!! FIXME: do non-RGBA textures map to same default values as D3D?
-
-    if (!shader_version_atleast(ctx, 2, 0))
+    if (!shader_version_atleast(ctx, 1, 4))
     {
-        // ps_1_0 and ps_1_4 are both different, too!
-        fail(ctx, "TEXLD <= Shader Model 2.0 unimplemented.");  // !!! FIXME
-        return;
+        DestArgInfo *info = &ctx->dest_arg;
+        char dst[64];
+        char sampler[64];
+        char code[128] = {0};
+
+        assert(!texldd);
+
+        RegisterList *sreg;
+        sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER, info->regnum);
+        const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+
+        // !!! FIXME: this code counts on the register not having swizzles, etc.
+        get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+        get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                                sampler, sizeof (sampler));
+
+        if (ttype == TEXTURE_TYPE_2D)
+        {
+            make_GLSL_destarg_assign(ctx, code, sizeof (code),
+                                     "texture2D(%s, %s.xy)",
+                                     sampler, dst);
+        }
+        else if (ttype == TEXTURE_TYPE_CUBE)
+        {
+            make_GLSL_destarg_assign(ctx, code, sizeof (code),
+                                     "textureCube(%s, %s.xyz)",
+                                     sampler, dst);
+        }
+        else if (ttype == TEXTURE_TYPE_VOLUME)
+        {
+            make_GLSL_destarg_assign(ctx, code, sizeof (code),
+                                     "texture3D(%s, %s.xyz)",
+                                     sampler, dst);
+        }
+        else
+        {
+            fail(ctx, "unexpected texture type");
+        } // else
+        output_line(ctx, "%s", code);
     } // if
+
+    else if (!shader_version_atleast(ctx, 2, 0))
+    {
+        // ps_1_4 is different, too!
+        fail(ctx, "TEXLD == Shader Model 1.4 unimplemented.");  // !!! FIXME
+        return;
+    } // else if
+
     else
     {
         const SourceArgInfo *samp_arg = &ctx->source_args[1];
@@ -3286,16 +3441,270 @@ static void emit_GLSL_TEXLD(Context *ctx)
 } // emit_GLSL_TEXLD
     
 
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXBEM)  // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXBEML) // !!! FIXME
+static void emit_GLSL_TEXBEM(Context *ctx)
+{
+    DestArgInfo *info = &ctx->dest_arg;
+    char dst[64]; get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+    char src[64]; get_GLSL_srcarg_varname(ctx, 0, src, sizeof (src));
+    char sampler[64];
+    char code[512];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                            sampler, sizeof (sampler));
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "texture2D(%s, vec2(%s.x + (%s_texbem.x * %s.x) + (%s_texbem.z * %s.y),"
+        " %s.y + (%s_texbem.y * %s.x) + (%s_texbem.w * %s.y)))",
+        sampler,
+        dst, sampler, src, sampler, src,
+        dst, sampler, src, sampler, src);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXBEM
+
+
+static void emit_GLSL_TEXBEML(Context *ctx)
+{
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    DestArgInfo *info = &ctx->dest_arg;
+    char dst[64]; get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+    char src[64]; get_GLSL_srcarg_varname(ctx, 0, src, sizeof (src));
+    char sampler[64];
+    char code[512];
+
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                            sampler, sizeof (sampler));
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "(texture2D(%s, vec2(%s.x + (%s_texbem.x * %s.x) + (%s_texbem.z * %s.y),"
+        " %s.y + (%s_texbem.y * %s.x) + (%s_texbem.w * %s.y)))) *"
+        " ((%s.z * %s_texbeml.x) + %s_texbem.y)",
+        sampler,
+        dst, sampler, src, sampler, src,
+        dst, sampler, src, sampler, src,
+        src, sampler, sampler);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXBEML
+
 EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXREG2AR) // !!! FIXME
 EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXREG2GB) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X2PAD) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X2TEX) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3PAD) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3TEX) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3SPEC) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3VSPEC) // !!! FIXME
+
+
+static void emit_GLSL_TEXM3X2PAD(Context *ctx)
+{
+    // no-op ... work happens in emit_GLSL_TEXM3X2TEX().
+} // emit_GLSL_TEXM3X2PAD
+
+static void emit_GLSL_TEXM3X2TEX(Context *ctx)
+{
+    if (ctx->texm3x2pad_src0 == -1)
+        return;
+
+    DestArgInfo *info = &ctx->dest_arg;
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char sampler[64];
+    char code[512];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                            sampler, sizeof (sampler));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x2pad_src0,
+                            src0, sizeof (src0));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x2pad_dst0,
+                            src1, sizeof (src1));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src2, sizeof (src2));
+    get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "texture2D(%s, vec2(dot(%s.xyz, %s.xyz), dot(%s.xyz, %s.xyz)))",
+        sampler, src0, src1, src2, dst);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXM3X2TEX
+
+static void emit_GLSL_TEXM3X3PAD(Context *ctx)
+{
+    // no-op ... work happens in emit_GLSL_TEXM3X3*().
+} // emit_GLSL_TEXM3X3PAD
+
+static void emit_GLSL_TEXM3X3TEX(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    DestArgInfo *info = &ctx->dest_arg;
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+    char sampler[64];
+    char code[512];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                            sampler, sizeof (sampler));
+
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER,
+                                      info->regnum);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+    const char *ttypestr = (ttype == TEXTURE_TYPE_CUBE) ? "Cube" : "3D";
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "texture%s(%s,"
+            " vec3(dot(%s.xyz, %s.xyz),"
+            " dot(%s.xyz, %s.xyz),"
+            " dot(%s.xyz, %s.xyz)))",
+        ttypestr, sampler, src0, src1, src2, src3, dst, src4);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXM3X3TEX
+
+static void emit_GLSL_TEXM3X3SPEC_helper(Context *ctx)
+{
+    if (ctx->glsl_generated_texm3x3spec_helper)
+        return;
+
+    ctx->glsl_generated_texm3x3spec_helper = 1;
+
+    push_output(ctx, &ctx->helpers);
+    output_line(ctx, "vec3 TEXM3X3SPEC_reflection(const vec3 normal, const vec3 eyeray)");
+    output_line(ctx, "{"); ctx->indent++;
+    output_line(ctx,   "return (2.0 * ((normal * eyeray) / (normal * normal)) * normal) - eyeray;"); ctx->indent--;
+    output_line(ctx, "}");
+    output_blank_line(ctx);
+    pop_output(ctx);
+} // emit_GLSL_TEXM3X3SPEC_helper
+
+static void emit_GLSL_TEXM3X3SPEC(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    DestArgInfo *info = &ctx->dest_arg;
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+    char src5[64];
+    char sampler[64];
+    char code[512];
+
+    emit_GLSL_TEXM3X3SPEC_helper(ctx);
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                            sampler, sizeof (sampler));
+
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[1].regnum,
+                            src5, sizeof (src5));
+    get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER,
+                                      info->regnum);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+    const char *ttypestr = (ttype == TEXTURE_TYPE_CUBE) ? "Cube" : "3D";
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "texture%s(%s, "
+            "TEXM3X3SPEC_reflection("
+                "vec3("
+                    "dot(%s.xyz, %s.xyz), "
+                    "dot(%s.xyz, %s.xyz), "
+                    "dot(%s.xyz, %s.xyz)"
+                "),"
+                "%s.xyz,"
+            ")"
+        ")",
+        ttypestr, sampler, src0, src1, src2, src3, dst, src4, src5);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXM3X3SPEC
+
+static void emit_GLSL_TEXM3X3VSPEC(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    DestArgInfo *info = &ctx->dest_arg;
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+    char sampler[64];
+    char code[512];
+
+    emit_GLSL_TEXM3X3SPEC_helper(ctx);
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_SAMPLER, info->regnum,
+                            sampler, sizeof (sampler));
+
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER,
+                                      info->regnum);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+    const char *ttypestr = (ttype == TEXTURE_TYPE_CUBE) ? "Cube" : "3D";
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "texture%s(%s, "
+            "TEXM3X3SPEC_reflection("
+                "vec3("
+                    "dot(%s.xyz, %s.xyz), "
+                    "dot(%s.xyz, %s.xyz), "
+                    "dot(%s.xyz, %s.xyz)"
+                "), "
+                "vec3(%s.w, %s.w, %s.w)"
+            ")"
+        ")",
+        ttypestr, sampler, src0, src1, src2, src3, dst, src4, src0, src2, dst);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXM3X3VSPEC
 
 static void emit_GLSL_EXPP(Context *ctx)
 {
@@ -3352,23 +3761,16 @@ static void emit_GLSL_comparison_operations(Context *ctx, const char *cmp)
         make_GLSL_srcarg_string(ctx, 1, mask, src1, sizeof (src1));
         make_GLSL_srcarg_string(ctx, 2, mask, src2, sizeof (src2));
 
-        dst->writemask = mask;
-        dst->writemask0 = ((mask >> 0) & 1);
-        dst->writemask1 = ((mask >> 1) & 1);
-        dst->writemask2 = ((mask >> 2) & 1);
-        dst->writemask3 = ((mask >> 3) & 1);
+        set_dstarg_writemask(dst, mask);
 
         char code[128];
         make_GLSL_destarg_assign(ctx, code, sizeof (code),
                                  "((%s %s) ? %s : %s)",
                                  src0, cmp, src1, src2);
-        dst->writemask = origmask;
-        dst->writemask0 = ((origmask >> 0) & 1);
-        dst->writemask1 = ((origmask >> 1) & 1);
-        dst->writemask2 = ((origmask >> 2) & 1);
-        dst->writemask3 = ((origmask >> 3) & 1);
         output_line(ctx, "%s", code);
     } // for
+
+    set_dstarg_writemask(dst, origmask);
 } // emit_GLSL_comparison_operations
 
 static void emit_GLSL_CND(Context *ctx)
@@ -3395,7 +3797,40 @@ EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXREG2RGB) // !!! FIXME
 EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXDP3TEX) // !!! FIXME
 EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X2DEPTH) // !!! FIXME
 EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXDP3) // !!! FIXME
-EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3) // !!! FIXME
+
+static void emit_GLSL_TEXM3X3(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+    char code[512];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_GLSL_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_GLSL_destarg_varname(ctx, dst, sizeof (dst));
+
+    make_GLSL_destarg_assign(ctx, code, sizeof (code),
+        "vec4(dot(%s.xyz, %s.xyz), dot(%s.xyz, %s.xyz), dot(%s.xyz, %s.xyz), 1.0)",
+        src0, src1, src2, src3, dst, src4);
+
+    output_line(ctx, "%s", code);
+} // emit_GLSL_TEXM3X3
+
 EMIT_GLSL_OPCODE_UNIMPLEMENTED_FUNC(TEXDEPTH) // !!! FIXME
 
 static void emit_GLSL_CMP(Context *ctx)
@@ -3576,6 +4011,33 @@ static const char *make_ARB1_srcarg_string_in_buf(Context *ctx,
                                                   const SourceArgInfo *arg,
                                                   char *buf, size_t buflen)
 {
+    // !!! FIXME: this can hit pathological cases where we look like this...
+    //
+    //    dp3 r1.xyz, t0_bx2, t0_bx2
+    //    mad r1.xyz, t0_bias, 1-r1, t0_bx2
+    //
+    // ...which do a lot of duplicate work in arb1...
+    //
+    //    SUB scratch0, t0, { 0.5, 0.5, 0.5, 0.5 };
+    //    MUL scratch0, scratch0, { 2.0, 2.0, 2.0, 2.0 };
+    //    SUB scratch1, t0, { 0.5, 0.5, 0.5, 0.5 };
+    //    MUL scratch1, scratch1, { 2.0, 2.0, 2.0, 2.0 };
+    //    DP3 r1.xyz, scratch0, scratch1;
+    //    SUB scratch0, t0, { 0.5, 0.5, 0.5, 0.5 };
+    //    SUB scratch1, { 1.0, 1.0, 1.0, 1.0 }, r1;
+    //    SUB scratch2, t0, { 0.5, 0.5, 0.5, 0.5 };
+    //    MUL scratch2, scratch2, { 2.0, 2.0, 2.0, 2.0 };
+    //    MAD r1.xyz, scratch0, scratch1, scratch2;
+    //
+    // ...notice that the dp3 calculates the same value into two scratch
+    //  registers. This case is easier to handle; just see if multiple
+    //  source args are identical, build it up once, and use the same
+    //  scratch register for multiple arguments in that opcode.
+    //  Even better still, only calculate things once across instructions,
+    //  and be smart about letting it linger in a scratch register until we
+    //  definitely don't need the calculation anymore. That's harder to
+    //  write, though.
+
     char regnum_str[16] = { '\0' };
 
     // !!! FIXME: use get_ARB1_varname_in_buf() instead?
@@ -3646,10 +4108,26 @@ static const char *make_ARB1_srcarg_string_in_buf(Context *ctx,
 
     // Some of the source mods need to generate instructions to a temp
     //  register, in which case we'll replace the register name.
+    const SourceMod mod = arg->src_mod;
+    const int inplace = ( (mod == SRCMOD_NONE) || (mod == SRCMOD_NEGATE) ||
+                          ((mod == SRCMOD_ABS) && support_nv2(ctx)) );
+
+    if (!inplace)
+    {
+        const size_t len = 64;
+        char *stackbuf = (char *) alloca(len);
+        regtype_str = allocate_ARB1_scratch_reg_name(ctx, stackbuf, len);
+        regnum_str[0] = '\0'; // move value to scratch register.
+        rel_lbracket = "";   // scratch register won't use array.
+        rel_rbracket = "";
+        rel_offset[0] = '\0';
+        rel_swizzle[0] = '\0';
+        rel_regtype_str = "";
+    } // if
 
     const char *premod_str = "";
     const char *postmod_str = "";
-    switch (arg->src_mod)
+    switch (mod)
     {
         case SRCMOD_NEGATE:
             premod_str = "-";
@@ -3659,29 +4137,30 @@ static const char *make_ARB1_srcarg_string_in_buf(Context *ctx,
             premod_str = "-";
             // fall through.
         case SRCMOD_BIAS:
-            fail(ctx, "SRCMOD_BIAS currently unsupported in arb1");
-            postmod_str = "_bias";
+            output_line(ctx, "SUB %s, %s, { 0.5, 0.5, 0.5, 0.5 };",
+                        regtype_str, buf);
             break;
 
         case SRCMOD_SIGNNEGATE:
             premod_str = "-";
             // fall through.
         case SRCMOD_SIGN:
-            fail(ctx, "SRCMOD_SIGN currently unsupported in arb1");
-            postmod_str = "_bx2";
+            output_line(ctx,
+                "MAD %s, %s, { 2.0, 2.0, 2.0, 2.0 }, { -1.0, -1.0, -1.0, -1.0 };",
+                regtype_str, buf);
             break;
 
         case SRCMOD_COMPLEMENT:
-            fail(ctx, "SRCMOD_COMPLEMENT currently unsupported in arb1");
-            premod_str = "1-";
+            output_line(ctx, "SUB %s, { 1.0, 1.0, 1.0, 1.0 }, %s;",
+                        regtype_str, buf);
             break;
 
         case SRCMOD_X2NEGATE:
             premod_str = "-";
             // fall through.
         case SRCMOD_X2:
-            fail(ctx, "SRCMOD_X2 currently unsupported in arb1");
-            postmod_str = "_x2";
+            output_line(ctx, "MUL %s, %s, { 2.0, 2.0, 2.0, 2.0 };",
+                        regtype_str, buf);
             break;
 
         case SRCMOD_DZ:
@@ -3698,22 +4177,12 @@ static const char *make_ARB1_srcarg_string_in_buf(Context *ctx,
             premod_str = "-";
             // fall through.
         case SRCMOD_ABS:
-            if (support_nv2(ctx))  // GL_NV_vertex_program2_option adds this.
-            {
-                premod_str = (arg->src_mod == SRCMOD_ABSNEGATE) ? "-|" : "|";
-                postmod_str = "|";
-            } // if
+            if (!support_nv2(ctx))  // GL_NV_vertex_program2_option adds this.
+                output_line(ctx, "ABS %s, %s;", regtype_str, buf);
             else
             {
-                regtype_str = allocate_ARB1_scratch_reg_name(ctx,
-                                                    (char *) alloca(64), 64);
-                regnum_str[0] = '\0'; // move value to scratch register.
-                rel_lbracket = "";   // scratch register won't use array.
-                rel_rbracket = "";
-                rel_offset[0] = '\0';
-                rel_swizzle[0] = '\0';
-                rel_regtype_str = "";
-                output_line(ctx, "ABS %s, %s;", regtype_str, buf);
+                premod_str = (mod == SRCMOD_ABSNEGATE) ? "-|" : "|";
+                postmod_str = "|";
             } // else
             break;
 
@@ -4051,6 +4520,15 @@ static void emit_ARB1_start(Context *ctx, const char *profilestr)
 
 static void emit_ARB1_end(Context *ctx)
 {
+    // ps_1_* writes color to r0 instead oC0. We move it to the right place.
+    // We don't have to worry about a RET opcode messing this up, since
+    //  RET isn't available before ps_2_0.
+    if (shader_is_pixel(ctx) && !shader_version_atleast(ctx, 2, 0))
+    {
+        set_used_register(ctx, REG_TYPE_COLOROUT, 0, 1);
+        output_line(ctx, "MOV oC0, r0;");
+    } // if
+
     output_line(ctx, "END");
 } // emit_ARB1_end
 
@@ -4109,6 +4587,22 @@ static void emit_ARB1_global(Context *ctx, RegisterType regtype, int regnum)
     switch (regtype)
     {
         case REG_TYPE_ADDRESS:
+            if (shader_is_pixel(ctx))  // actually REG_TYPE_TEXTURE.
+            {
+                // We have to map texture registers to temps for ps_1_1, since
+                //  they work like temps, initialize with tex coords, and the
+                //  ps_1_1 TEX opcode expects to overwrite it.
+                if (!shader_version_atleast(ctx, 1, 4))
+                {
+                    output_line(ctx, "%s %s;", arb1_float_temp(ctx), varname);
+                    push_output(ctx, &ctx->mainline_intro);
+                    output_line(ctx, "MOV %s, fragment.texcoord[%d];",
+                                varname, regnum);
+                    pop_output(ctx);
+                } // if
+                break;
+            } // if
+
             // nv4 replaced address registers with generic int registers.
             if (support_nv4(ctx))
                 output_line(ctx, "INT TEMP %s;", varname);
@@ -4242,9 +4736,22 @@ static void emit_ARB1_uniform(Context *ctx, RegisterType regtype, int regnum,
     pop_output(ctx);
 } // emit_ARB1_uniform
 
-static void emit_ARB1_sampler(Context *ctx, int stage, TextureType ttype)
+static void emit_ARB1_sampler(Context *ctx,int stage,TextureType ttype,int tb)
 {
-    // this is a no-op...you don't predeclare samplers in arb1.
+    // this is mostly a no-op...you don't predeclare samplers in arb1.
+
+    if (tb)  // This sampler used a ps_1_1 TEXBEM opcode?
+    {
+        const int index = ctx->uniform_float4_count + ctx->uniform_int4_count +
+                          ctx->uniform_bool_count;
+        char var[64];
+        get_ARB1_varname_in_buf(ctx, REG_TYPE_SAMPLER, stage, var, sizeof(var));
+        push_output(ctx, &ctx->globals);
+        output_line(ctx, "PARAM %s_texbem = program.local[%d];", var, index);
+        output_line(ctx, "PARAM %s_texbeml = program.local[%d];", var, index+1);
+        pop_output(ctx);
+        ctx->uniform_float4_count += 2;
+    } // if
 } // emit_ARB1_sampler
 
 // !!! FIXME: a lot of cut-and-paste here from emit_GLSL_attribute().
@@ -4419,10 +4926,15 @@ static void emit_ARB1_attribute(Context *ctx, RegisterType regtype, int regnum,
         {
             if (usage == MOJOSHADER_USAGE_TEXCOORD)
             {
-                snprintf(index_str, sizeof (index_str), "%u", (uint) index);
-                usage_str = "fragment.texcoord";
-                arrayleft = "[";
-                arrayright = "]";
+                // ps_1_1 does a different hack for this attribute.
+                //  Refer to emit_ARB1_global()'s REG_TYPE_TEXTURE code.
+                if (shader_version_atleast(ctx, 1, 4))
+                {
+                    snprintf(index_str, sizeof (index_str), "%u", (uint) index);
+                    usage_str = "fragment.texcoord";
+                    arrayleft = "[";
+                    arrayright = "]";
+                } // if
             } // if
 
             else if (usage == MOJOSHADER_USAGE_COLOR)
@@ -4592,14 +5104,34 @@ static void emit_ARB1_LRP(Context *ctx)
 
 EMIT_ARB1_OPCODE_DS_FUNC(FRC)
 
-// !!! FIXME: these could be implemented with vector opcodes, but it looks
-// !!! FIXME:  like the Microsoft HLSL compiler never generates matrix
-// !!! FIXME:  operations for some reason.
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(M4X4)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(M4X3)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(M3X4)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(M3X3)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(M3X2)
+static void arb1_MxXy(Context *ctx, const int x, const int y)
+{
+    DestArgInfo *dstarg = &ctx->dest_arg;
+    const int origmask = dstarg->writemask;
+    char src0[64];
+    int i;
+
+    make_ARB1_srcarg_string(ctx, 0, src0, sizeof (src0));
+
+    for (i = 0; i < y; i++)
+    {
+        char dst[64];
+        char row[64];
+        make_ARB1_srcarg_string(ctx, i + 1, row, sizeof (row));
+        set_dstarg_writemask(dstarg, 1 << i);
+        make_ARB1_destarg_string(ctx, dst, sizeof (dst));
+        output_line(ctx, "DP%d%s, %s, %s;", x, dst, src0, row);
+    } // for
+
+    set_dstarg_writemask(dstarg, origmask);
+    emit_ARB1_dest_modifiers(ctx);
+} // arb1_MxXy
+
+static void emit_ARB1_M4X4(Context *ctx) { arb1_MxXy(ctx, 4, 4); }
+static void emit_ARB1_M4X3(Context *ctx) { arb1_MxXy(ctx, 4, 3); }
+static void emit_ARB1_M3X4(Context *ctx) { arb1_MxXy(ctx, 3, 4); }
+static void emit_ARB1_M3X3(Context *ctx) { arb1_MxXy(ctx, 3, 3); }
+static void emit_ARB1_M3X2(Context *ctx) { arb1_MxXy(ctx, 3, 2); }
 
 static void emit_ARB1_CALL(Context *ctx)
 {
@@ -5085,26 +5617,294 @@ static void emit_ARB1_TEXKILL(Context *ctx)
     output_line(ctx, "KIL %s.xyzx;", dst);
 } // emit_ARB1_TEXKILL
 
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXBEM)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXBEML)
+static void arb1_texbem(Context *ctx, const int luminance)
+{
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    const int stage = ctx->dest_arg.regnum;
+    char dst[64]; get_ARB1_destarg_varname(ctx, dst, sizeof (dst));
+    char src[64]; get_ARB1_srcarg_varname(ctx, 0, src, sizeof (src));
+    char tmp[64]; allocate_ARB1_scratch_reg_name(ctx, tmp, sizeof (tmp));
+    char sampler[64];
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_SAMPLER, stage,
+                            sampler, sizeof (sampler));
+
+    output_line(ctx, "MUL %s, %s_texbem.xzyw, %s.xyxy;", tmp, sampler, src);
+    output_line(ctx, "ADD %s.xy, %s.xzxx, %s.ywxx;", tmp, tmp, tmp);
+    output_line(ctx, "ADD %s.xy, %s, %s;", tmp, tmp, dst);
+    output_line(ctx, "TEX %s, %s, texture[%d], 2D;", dst, tmp, stage);
+
+    if (luminance)  // TEXBEML, not just TEXBEM?
+    {
+        output_line(ctx, "MAD %s, %s.zzzz, %s_texbeml.xxxx, %s_texbeml.yyyy;",
+                    tmp, src, sampler, sampler);
+        output_line(ctx, "MUL %s, %s, %s;", dst, dst, tmp);
+    } // if
+
+    emit_ARB1_dest_modifiers(ctx);
+} // arb1_texbem
+
+static void emit_ARB1_TEXBEM(Context *ctx)
+{
+    arb1_texbem(ctx, 0);
+} // emit_ARB1_TEXBEM
+
+static void emit_ARB1_TEXBEML(Context *ctx)
+{
+    arb1_texbem(ctx, 1);
+} // emit_ARB1_TEXBEML
+
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXREG2AR)
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXREG2GB)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X2PAD)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X2TEX)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3PAD)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3TEX)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3SPEC)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3VSPEC)
+
+
+static void emit_ARB1_TEXM3X2PAD(Context *ctx)
+{
+    // no-op ... work happens in emit_ARB1_TEXM3X2TEX().
+} // emit_ARB1_TEXM3X2PAD
+
+static void emit_ARB1_TEXM3X2TEX(Context *ctx)
+{
+    if (ctx->texm3x2pad_src0 == -1)
+        return;
+
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    const int stage = ctx->dest_arg.regnum;
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x2pad_src0,
+                            src0, sizeof (src0));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x2pad_dst0,
+                            src1, sizeof (src1));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src2, sizeof (src2));
+    get_ARB1_destarg_varname(ctx, dst, sizeof (dst));
+
+    output_line(ctx, "DP3 %s.y, %s, %s;", dst, src2, dst);
+    output_line(ctx, "DP3 %s.x, %s, %s;", dst, src0, src1);
+    output_line(ctx, "TEX %s, %s, texture[%d], 2D;", dst, dst, stage);
+    emit_ARB1_dest_modifiers(ctx);
+} // emit_ARB1_TEXM3X2TEX
+
+
+static void emit_ARB1_TEXM3X3PAD(Context *ctx)
+{
+    // no-op ... work happens in emit_ARB1_TEXM3X3*().
+} // emit_ARB1_TEXM3X3PAD
+
+
+static void emit_ARB1_TEXM3X3TEX(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    const int stage = ctx->dest_arg.regnum;
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_ARB1_destarg_varname(ctx, dst, sizeof (dst));
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER, stage);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+    const char *ttypestr = (ttype == TEXTURE_TYPE_CUBE) ? "CUBE" : "3D";
+
+    output_line(ctx, "DP3 %s.z, %s, %s;", dst, dst, src4);
+    output_line(ctx, "DP3 %s.x, %s, %s;", dst, src0, src1);
+    output_line(ctx, "DP3 %s.y, %s, %s;", dst, src2, src3);
+    output_line(ctx, "TEX %s, %s, texture[%d], %s;", dst, dst, stage, ttypestr);
+    emit_ARB1_dest_modifiers(ctx);
+} // emit_ARB1_TEXM3X3TEX
+
+static void emit_ARB1_TEXM3X3SPEC(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+    char src5[64];
+    char tmp[64];
+    char tmp2[64];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    const int stage = ctx->dest_arg.regnum;
+    allocate_ARB1_scratch_reg_name(ctx, tmp, sizeof (tmp));
+    allocate_ARB1_scratch_reg_name(ctx, tmp2, sizeof (tmp2));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[1].regnum,
+                            src5, sizeof (src5));
+    get_ARB1_destarg_varname(ctx, dst, sizeof (dst));
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER, stage);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+    const char *ttypestr = (ttype == TEXTURE_TYPE_CUBE) ? "CUBE" : "3D";
+
+    output_line(ctx, "DP3 %s.z, %s, %s;", dst, dst, src4);
+    output_line(ctx, "DP3 %s.x, %s, %s;", dst, src0, src1);
+    output_line(ctx, "DP3 %s.y, %s, %s;", dst, src2, src3);
+    output_line(ctx, "MUL %s, %s, %s;", tmp, dst, dst);    // normal * normal
+    output_line(ctx, "MUL %s, %s, %s;", tmp2, dst, src5);  // normal * eyeray
+
+    // !!! FIXME: This is goofy. There's got to be a way to do vector-wide
+    // !!! FIXME:  divides or reciprocals...right?
+    output_line(ctx, "RCP %s.x, %s.x;", tmp2, tmp2);
+    output_line(ctx, "RCP %s.y, %s.y;", tmp2, tmp2);
+    output_line(ctx, "RCP %s.z, %s.z;", tmp2, tmp2);
+    output_line(ctx, "RCP %s.w, %s.w;", tmp2, tmp2);
+    output_line(ctx, "MUL %s, %s, %s;", tmp, tmp, tmp2);
+
+    output_line(ctx, "MUL %s, %s, { 2.0, 2.0, 2.0, 2.0 };", tmp, tmp);
+    output_line(ctx, "MAD %s, %s, %s, -%s;", tmp, tmp, dst, src5);
+    output_line(ctx, "TEX %s, %s, texture[%d], %s;", dst, tmp, stage, ttypestr);
+    emit_ARB1_dest_modifiers(ctx);
+} // emit_ARB1_TEXM3X3SPEC
+
+static void emit_ARB1_TEXM3X3VSPEC(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+    char tmp[64];
+    char tmp2[64];
+    char tmp3[64];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    const int stage = ctx->dest_arg.regnum;
+    allocate_ARB1_scratch_reg_name(ctx, tmp, sizeof (tmp));
+    allocate_ARB1_scratch_reg_name(ctx, tmp2, sizeof (tmp2));
+    allocate_ARB1_scratch_reg_name(ctx, tmp3, sizeof (tmp3));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_ARB1_destarg_varname(ctx, dst, sizeof (dst));
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER, stage);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+    const char *ttypestr = (ttype == TEXTURE_TYPE_CUBE) ? "CUBE" : "3D";
+
+    output_line(ctx, "MOV %s.x, %s.w;", tmp3, src0);
+    output_line(ctx, "MOV %s.y, %s.w;", tmp3, src2);
+    output_line(ctx, "MOV %s.z, %s.w;", tmp3, dst);
+    output_line(ctx, "DP3 %s.z, %s, %s;", dst, dst, src4);
+    output_line(ctx, "DP3 %s.x, %s, %s;", dst, src0, src1);
+    output_line(ctx, "DP3 %s.y, %s, %s;", dst, src2, src3);
+    output_line(ctx, "MUL %s, %s, %s;", tmp, dst, dst);    // normal * normal
+    output_line(ctx, "MUL %s, %s, %s;", tmp2, dst, tmp3);  // normal * eyeray
+
+    // !!! FIXME: This is goofy. There's got to be a way to do vector-wide
+    // !!! FIXME:  divides or reciprocals...right?
+    output_line(ctx, "RCP %s.x, %s.x;", tmp2, tmp2);
+    output_line(ctx, "RCP %s.y, %s.y;", tmp2, tmp2);
+    output_line(ctx, "RCP %s.z, %s.z;", tmp2, tmp2);
+    output_line(ctx, "RCP %s.w, %s.w;", tmp2, tmp2);
+    output_line(ctx, "MUL %s, %s, %s;", tmp, tmp, tmp2);
+
+    output_line(ctx, "MUL %s, %s, { 2.0, 2.0, 2.0, 2.0 };", tmp, tmp);
+    output_line(ctx, "MAD %s, %s, %s, -%s;", tmp, tmp, dst, tmp3);
+    output_line(ctx, "TEX %s, %s, texture[%d], %s;", dst, tmp, stage, ttypestr);
+    emit_ARB1_dest_modifiers(ctx);
+} // emit_ARB1_TEXM3X3VSPEC
 
 static void emit_ARB1_EXPP(Context *ctx) { emit_ARB1_opcode_ds(ctx, "EX2"); }
 static void emit_ARB1_LOGP(Context *ctx) { arb1_log(ctx, "LG2"); }
 
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(CND)
+static void emit_ARB1_CND(Context *ctx)
+{
+    char dst[64]; make_ARB1_destarg_string(ctx, dst, sizeof (dst));
+    char src0[64]; make_ARB1_srcarg_string(ctx, 0, src0, sizeof (src0));
+    char src1[64]; make_ARB1_srcarg_string(ctx, 1, src1, sizeof (src1));
+    char src2[64]; make_ARB1_srcarg_string(ctx, 2, src2, sizeof (src2));
+    char tmp[64]; allocate_ARB1_scratch_reg_name(ctx, tmp, sizeof (tmp));
+
+    // CND compares against 0.5, but we need to compare against 0.0...
+    //  ...subtract to make up the difference.
+    output_line(ctx, "SUB %s, %s, { 0.5, 0.5, 0.5, 0.5 };", tmp, src0);
+    // D3D tests (src0 >= 0.0), but ARB1 tests (src0 < 0.0) ... so just
+    //  switch src1 and src2 to get the same results.
+    output_line(ctx, "CMP%s, %s, %s, %s;", dst, tmp, src2, src1);
+    emit_ARB1_dest_modifiers(ctx);
+} // emit_ARB1_CND
+
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXREG2RGB)
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXDP3TEX)
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X2DEPTH)
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXDP3)
-EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXM3X3)
+
+static void emit_ARB1_TEXM3X3(Context *ctx)
+{
+    if (ctx->texm3x3pad_src1 == -1)
+        return;
+
+    char dst[64];
+    char src0[64];
+    char src1[64];
+    char src2[64];
+    char src3[64];
+    char src4[64];
+
+    // !!! FIXME: this code counts on the register not having swizzles, etc.
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst0,
+                            src0, sizeof (src0));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src0,
+                            src1, sizeof (src1));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_dst1,
+                            src2, sizeof (src2));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->texm3x3pad_src1,
+                            src3, sizeof (src3));
+    get_ARB1_varname_in_buf(ctx, REG_TYPE_TEXTURE, ctx->source_args[0].regnum,
+                            src4, sizeof (src4));
+    get_ARB1_destarg_varname(ctx, dst, sizeof (dst));
+
+    output_line(ctx, "DP3 %s.z, %s, %s;", dst, dst, src4);
+    output_line(ctx, "DP3 %s.x, %s, %s;", dst, src0, src1);
+    output_line(ctx, "DP3 %s.y, %s, %s;", dst, src2, src3);
+    output_line(ctx, "MOV %s.w, { 1.0, 1.0, 1.0, 1.0 };", dst);
+    emit_ARB1_dest_modifiers(ctx);
+} // emit_ARB1_TEXM3X3
+
 EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXDEPTH)
 
 static void emit_ARB1_CMP(Context *ctx)
@@ -5168,13 +5968,18 @@ static void arb1_texld(Context *ctx, const char *opcode, const int texldd)
     if ((ctx->dest_arg.result_mod & MOD_PP) && (support_nv4(ctx)))
         ctx->dest_arg.result_mod &= ~MOD_PP;
 
-    // !!! FIXME: do non-RGBA textures map to same default values as D3D?
     char dst[64]; make_ARB1_destarg_string(ctx, dst, sizeof (dst));
-    const SourceArgInfo *samp_arg = &ctx->source_args[1];
-    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER,
-                                      samp_arg->regnum);
+
+    const int sm1 = !shader_version_atleast(ctx, 1, 4);
+    const int regnum = sm1 ? ctx->dest_arg.regnum : ctx->source_args[1].regnum;
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER, regnum);
+
     const char *ttype = NULL;
-    char src0[64]; get_ARB1_srcarg_varname(ctx, 0, src0, sizeof (src0));
+    char src0[64];
+    if (sm1)
+        get_ARB1_destarg_varname(ctx, src0, sizeof (src0));
+    else
+        get_ARB1_srcarg_varname(ctx, 0, src0, sizeof (src0));
     //char src1[64]; get_ARB1_srcarg_varname(ctx, 1, src1, sizeof (src1));  // !!! FIXME: SRC_MOD?
 
     char src2[64] = { 0 };
@@ -5193,7 +5998,8 @@ static void arb1_texld(Context *ctx, const char *opcode, const int texldd)
         return;
     } // if
 
-    if (!no_swizzle(samp_arg->swizzle))
+    // SM1 only specifies dst, so don't check swizzle there.
+    if ( !sm1 && (!no_swizzle(ctx->source_args[1].swizzle)) )
     {
         // !!! FIXME: does this ever actually happen?
         fail(ctx, "BUG: can't handle TEXLD with sampler swizzle at the moment");
@@ -5210,12 +6016,12 @@ static void arb1_texld(Context *ctx, const char *opcode, const int texldd)
     if (texldd)
     {
         output_line(ctx, "%s%s, %s, %s, %s, texture[%d], %s;", opcode, dst,
-                    src0, src2, src3, samp_arg->regnum, ttype);
+                    src0, src2, src3, regnum, ttype);
     } // if
     else
     {
         output_line(ctx, "%s%s, %s, texture[%d], %s;", opcode, dst, src0,
-                    samp_arg->regnum, ttype);
+                    regnum, ttype);
     } // else
 } // arb1_texld
 
@@ -5333,10 +6139,16 @@ EMIT_ARB1_OPCODE_UNIMPLEMENTED_FUNC(TEXCRD)
 
 static void emit_ARB1_TEXLD(Context *ctx)
 {
-    if (!shader_version_atleast(ctx, 2, 0))
+    if (!shader_version_atleast(ctx, 1, 4))
     {
-        // ps_1_0 and ps_1_4 are both different, too!
-        fail(ctx, "TEXLD <= Shader Model 2.0 unimplemented.");  // !!! FIXME
+        arb1_texld(ctx, "TEX", 0);
+        return;
+    } // if
+
+    else if (!shader_version_atleast(ctx, 2, 0))
+    {
+        // ps_1_4 is different, too!
+        fail(ctx, "TEXLD == Shader Model 1.4 unimplemented.");  // !!! FIXME
         return;
     } // if
 
@@ -5435,11 +6247,7 @@ static int parse_destination_token(Context *ctx, DestArgInfo *info)
     else
         writemask = info->orig_writemask;
 
-    info->writemask = writemask;
-    info->writemask0 = (int) ((writemask >> 0) & 0x1); // bit 16
-    info->writemask1 = (int) ((writemask >> 1) & 0x1); // bit 17
-    info->writemask2 = (int) ((writemask >> 2) & 0x1); // bit 18
-    info->writemask3 = (int) ((writemask >> 3) & 0x1); // bit 19
+    set_dstarg_writemask(info, writemask);  // bits 16 through 19.
 
     // all the REG_TYPE_CONSTx types are the same register type, it's just
     //  split up so its regnum can be > 2047 in the bytecode. Clean it up.
@@ -5514,7 +6322,7 @@ static int parse_destination_token(Context *ctx, DestArgInfo *info)
         fail(ctx, "Register type is out of range");
 
     if (!isfail(ctx))
-        set_used_register(ctx, info->regtype, info->regnum);
+        set_used_register(ctx, info->regtype, info->regnum, 1);
 
     return 1;
 } // parse_destination_token
@@ -5780,7 +6588,7 @@ static int parse_source_token(Context *ctx, SourceArgInfo *info)
                     {
                         var->used = 1;
                         info->relative_array = var;
-                        set_used_register(ctx, info->relative_regtype, info->relative_regnum);
+                        set_used_register(ctx, info->relative_regtype, info->relative_regnum, 0);
                     } // else
                 } // else
             } // if
@@ -5837,7 +6645,17 @@ static int parse_source_token(Context *ctx, SourceArgInfo *info)
     //    None of the constant floating-point registers can use the abs modifier.
 
     if (!isfail(ctx))
-        set_used_register(ctx, info->regtype, info->regnum);
+    {
+        RegisterList *reg;
+        reg = set_used_register(ctx, info->regtype, info->regnum, 0);
+        // !!! FIXME: this test passes if you write to the register
+        // !!! FIXME:  in this same instruction, because we parse the
+        // !!! FIXME:  destination token first.
+        // !!! FIXME: Microsoft's shader validation explicitly checks temp
+        // !!! FIXME:  registers for this...do they check other writable ones?
+        if ((info->regtype == REG_TYPE_TEMP) && (reg) && (!reg->written))
+            failf(ctx, "Temp register r%d used uninitialized", info->regnum);
+    } // if
 
     return retval;
 } // parse_source_token
@@ -6310,7 +7128,7 @@ static void state_DCL(Context *ctx)
     else if (shader_is_pixel(ctx))
     {
         if (regtype == REG_TYPE_SAMPLER)
-            add_sampler(ctx, regtype, regnum, (TextureType) ctx->dwords[0]);
+            add_sampler(ctx, regnum, (TextureType) ctx->dwords[0], 0);
         else
         {
             const MOJOSHADER_usage usage = (MOJOSHADER_usage) ctx->dwords[0];
@@ -6362,7 +7180,7 @@ static void srcarg_matrix_replicate(Context *ctx, const int idx,
     {
         memcpy(dst, src, sizeof (SourceArgInfo));
         dst->regnum += (i + 1);
-        set_used_register(ctx, dst->regtype, dst->regnum);
+        set_used_register(ctx, dst->regtype, dst->regnum, 0);
     } // for
 } // srcarg_matrix_replicate
 
@@ -6618,7 +7436,7 @@ static void state_CND(Context *ctx)
     {
         const SourceArgInfo *src = &ctx->source_args[0];
         if ((src->regtype != REG_TYPE_TEMP) || (src->regnum != 0) ||
-            (src->swizzle != 0x0000))
+            (src->swizzle != 0xFF))
         {
             fail(ctx, "CND src must be r0.a in this shader model");
         } // if
@@ -6721,6 +7539,168 @@ static void state_TEXKILL(Context *ctx)
     // !!! FIXME: there are further limitations in ps_1_3 and earlier.
 } // state_TEXKILL
 
+// Some rules that apply to some of the fruity ps_1_1 texture opcodes...
+static void state_texops(Context *ctx, const char *opcode,
+                         const int dims, const int texbem)
+{
+    const DestArgInfo *dst = &ctx->dest_arg;
+    const SourceArgInfo *src = &ctx->source_args[0];
+    if (dst->regtype != REG_TYPE_TEXTURE)
+        failf(ctx, "%s destination must be a texture register", opcode);
+    if (src->regtype != REG_TYPE_TEXTURE)
+        failf(ctx, "%s source must be a texture register", opcode);
+    if (src->regnum >= dst->regnum)  // so says MSDN.
+        failf(ctx, "%s dest must be a higher register than source", opcode);
+
+    if (dims)
+    {
+        TextureType ttyp = (dims == 2) ? TEXTURE_TYPE_2D : TEXTURE_TYPE_CUBE;
+        add_sampler(ctx, dst->regnum, ttyp, texbem);
+    } // if
+
+    add_attribute_register(ctx, REG_TYPE_TEXTURE, dst->regnum,
+                           MOJOSHADER_USAGE_TEXCOORD, dst->regnum, 0xF, 0);
+
+    // Strictly speaking, there should be a TEX opcode prior to this call that
+    //  should fill in this metadata, but I'm not sure that's required for the
+    //  shader to assemble in D3D, so we'll do this so we don't fail with a
+    //  cryptic error message even if the developer didn't do the TEX.
+    add_attribute_register(ctx, REG_TYPE_TEXTURE, src->regnum,
+                           MOJOSHADER_USAGE_TEXCOORD, src->regnum, 0xF, 0);
+} // state_texops
+
+static void state_texbem(Context *ctx, const char *opcode)
+{
+    // The TEXBEM equasion, according to MSDN:
+    //u' = TextureCoordinates(stage m)u + D3DTSS_BUMPENVMAT00(stage m)*t(n)R
+    //         + D3DTSS_BUMPENVMAT10(stage m)*t(n)G
+    //v' = TextureCoordinates(stage m)v + D3DTSS_BUMPENVMAT01(stage m)*t(n)R
+    //         + D3DTSS_BUMPENVMAT11(stage m)*t(n)G
+    //t(m)RGBA = TextureSample(stage m)
+    //
+    // ...TEXBEML adds this at the end:
+    //t(m)RGBA = t(m)RGBA * [(t(n)B * D3DTSS_BUMPENVLSCALE(stage m)) +
+    //           D3DTSS_BUMPENVLOFFSET(stage m)]
+
+    if (shader_version_atleast(ctx, 1, 4))
+        failf(ctx, "%s opcode not available after Shader Model 1.3", opcode);
+
+    if (!shader_version_atleast(ctx, 1, 2))
+    {
+        if (ctx->source_args[0].src_mod == SRCMOD_SIGN)
+            failf(ctx, "%s forbids _bx2 on source reg before ps_1_2", opcode);
+    } // if
+
+    // !!! FIXME: MSDN:
+    // !!! FIXME: Register data that has been read by a texbem
+    // !!! FIXME:  or texbeml instruction cannot be read later,
+    // !!! FIXME:  except by another texbem or texbeml.
+
+    state_texops(ctx, opcode, 2, 1);
+} // state_texbem
+
+static void state_TEXBEM(Context *ctx)
+{
+    state_texbem(ctx, "TEXBEM");
+} // state_TEXBEM
+
+static void state_TEXBEML(Context *ctx)
+{
+    state_texbem(ctx, "TEXBEML");
+} // state_TEXBEML
+
+static void state_TEXM3X2PAD(Context *ctx)
+{
+    if (shader_version_atleast(ctx, 1, 4))
+        fail(ctx, "TEXM3X2PAD opcode not available after Shader Model 1.3");
+    state_texops(ctx, "TEXM3X2PAD", 0, 0);
+    // !!! FIXME: check for correct opcode existance and order more rigorously?
+    ctx->texm3x2pad_src0 = ctx->source_args[0].regnum;
+    ctx->texm3x2pad_dst0 = ctx->dest_arg.regnum;
+} // state_TEXM3X2PAD
+
+static void state_TEXM3X2TEX(Context *ctx)
+{
+    if (shader_version_atleast(ctx, 1, 4))
+        fail(ctx, "TEXM3X2TEX opcode not available after Shader Model 1.3");
+    if (ctx->texm3x2pad_dst0 == -1)
+        fail(ctx, "TEXM3X2TEX opcode without matching TEXM3X2PAD");
+    // !!! FIXME: check for correct opcode existance and order more rigorously?
+    state_texops(ctx, "TEXM3X2TEX", 2, 0);
+    ctx->reset_texmpad = 1;
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER,
+                                      ctx->dest_arg.regnum);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+
+    // A samplermap might change this to something nonsensical.
+    if (ttype != TEXTURE_TYPE_2D)
+        fail(ctx, "TEXM3X2TEX needs a 2D sampler");
+} // state_TEXM3X2TEX
+
+static void state_TEXM3X3PAD(Context *ctx)
+{
+    if (shader_version_atleast(ctx, 1, 4))
+        fail(ctx, "TEXM3X2TEX opcode not available after Shader Model 1.3");
+    state_texops(ctx, "TEXM3X3PAD", 0, 0);
+
+    // !!! FIXME: check for correct opcode existance and order more rigorously?
+    if (ctx->texm3x3pad_dst0 == -1)
+    {
+        ctx->texm3x3pad_src0 = ctx->source_args[0].regnum;
+        ctx->texm3x3pad_dst0 = ctx->dest_arg.regnum;
+    } // if
+    else if (ctx->texm3x3pad_dst1 == -1)
+    {
+        ctx->texm3x3pad_src1 = ctx->source_args[0].regnum;
+        ctx->texm3x3pad_dst1 = ctx->dest_arg.regnum;
+    } // else
+} // state_TEXM3X3PAD
+
+static void state_texm3x3(Context *ctx, const char *opcode, const int dims)
+{
+    // !!! FIXME: check for correct opcode existance and order more rigorously?
+    if (shader_version_atleast(ctx, 1, 4))
+        failf(ctx, "%s opcode not available after Shader Model 1.3", opcode);
+    if (ctx->texm3x3pad_dst1 == -1)
+        failf(ctx, "%s opcode without matching TEXM3X3PADs", opcode);
+    state_texops(ctx, opcode, dims, 0);
+    ctx->reset_texmpad = 1;
+
+    RegisterList *sreg = reglist_find(&ctx->samplers, REG_TYPE_SAMPLER,
+                                      ctx->dest_arg.regnum);
+    const TextureType ttype = (TextureType) (sreg ? sreg->index : 0);
+
+    // A samplermap might change this to something nonsensical.
+    if ((ttype != TEXTURE_TYPE_VOLUME) && (ttype != TEXTURE_TYPE_CUBE))
+        failf(ctx, "%s needs a 3D or Cubemap sampler", opcode);
+} // state_texm3x3
+
+static void state_TEXM3X3(Context *ctx)
+{
+    if (!shader_version_atleast(ctx, 1, 2))
+        fail(ctx, "TEXM3X3 opcode not available in Shader Model 1.1");
+    state_texm3x3(ctx, "TEXM3X3", 0);
+} // state_TEXM3X3
+
+static void state_TEXM3X3TEX(Context *ctx)
+{
+    state_texm3x3(ctx, "TEXM3X3TEX", 3);
+} // state_TEXM3X3TEX
+
+static void state_TEXM3X3SPEC(Context *ctx)
+{
+    state_texm3x3(ctx, "TEXM3X3SPEC", 3);
+    if (ctx->source_args[1].regtype != REG_TYPE_CONST)
+        fail(ctx, "TEXM3X3SPEC final arg must be a constant register");
+} // state_TEXM3X3SPEC
+
+static void state_TEXM3X3VSPEC(Context *ctx)
+{
+    state_texm3x3(ctx, "TEXM3X3VSPEC", 3);
+} // state_TEXM3X3VSPEC
+
+
 static void state_TEXLD(Context *ctx)
 {
     if (shader_version_atleast(ctx, 2, 0))
@@ -6750,7 +7730,7 @@ static void state_TEXLD(Context *ctx)
         else if (src1->regtype != REG_TYPE_SAMPLER)
             fail(ctx, "TEXLD src1 must be sampler register");
         else if (src1->src_mod != SRCMOD_NONE)
-            fail(ctx, "TEXLD src0 must have no modifiers");
+            fail(ctx, "TEXLD src1 must have no modifiers");
         else if ( (ctx->instruction_controls != CONTROL_TEXLD) &&
                   (ctx->instruction_controls != CONTROL_TEXLDP) &&
                   (ctx->instruction_controls != CONTROL_TEXLDB) )
@@ -6771,7 +7751,22 @@ static void state_TEXLD(Context *ctx)
             ctx->instruction_count += 3;
     } // if
 
-    // !!! FIXME: checks for ps_1_4 and ps_1_0 versions here...
+    else if (shader_version_atleast(ctx, 1, 4))
+    {
+        // !!! FIXME: checks for ps_1_4 version here...
+    } // else if
+
+    else
+    {
+        // !!! FIXME: add (other?) checks for ps_1_1 version here...
+        const DestArgInfo *info = &ctx->dest_arg;
+        const int sampler = info->regnum;
+        if (info->regtype != REG_TYPE_TEXTURE)
+            fail(ctx, "TEX param must be a texture register");
+        add_sampler(ctx, sampler, TEXTURE_TYPE_2D, 0);
+        add_attribute_register(ctx, REG_TYPE_TEXTURE, sampler,
+                               MOJOSHADER_USAGE_TEXCOORD, sampler, 0xF, 0);
+    } // else
 } // state_TEXLD
 
 static void state_TEXLDL(Context *ctx)
@@ -6856,14 +7851,13 @@ static int parse_instruction_token(Context *ctx)
         return insttoks + 1;  // pray that you resync later.
     } // if
 
+    ctx->coissue = coissue;
     if (coissue)
     {
         if (!shader_is_pixel(ctx))
             fail(ctx, "coissue instruction on non-pixel shader");
         if (shader_version_atleast(ctx, 2, 0))
             fail(ctx, "coissue instruction in Shader Model >= 2.0");
-        // !!! FIXME: I'm not sure what this actually means, yet.
-        fail(ctx, "coissue instructions unsupported");
     } // if
 
     if ((ctx->shader_type & instruction->shader_types) == 0)
@@ -6895,6 +7889,17 @@ static int parse_instruction_token(Context *ctx)
 
     if (!isfail(ctx))
         emitter(ctx);  // call the profile's emitter.
+
+    if (ctx->reset_texmpad)
+    {
+        ctx->texm3x2pad_dst0 = -1;
+        ctx->texm3x2pad_src0 = -1;
+        ctx->texm3x3pad_dst0 = -1;
+        ctx->texm3x3pad_src0 = -1;
+        ctx->texm3x3pad_dst1 = -1;
+        ctx->texm3x3pad_src1 = -1;
+        ctx->reset_texmpad = 0;
+    } // if
 
     ctx->previous_opcode = opcode;
     ctx->scratch_registers = 0;  // reset after every instruction.
@@ -7651,6 +8656,8 @@ static Context *build_context(const char *profile,
                               const unsigned int bufsize,
                               const MOJOSHADER_swizzle *swiz,
                               const unsigned int swizcount,
+                              const MOJOSHADER_samplerMap *smap,
+                              const unsigned int smapcount,
                               MOJOSHADER_malloc m, MOJOSHADER_free f, void *d)
 {
     if (m == NULL) m = MOJOSHADER_internal_malloc;
@@ -7669,10 +8676,18 @@ static Context *build_context(const char *profile,
     ctx->tokencount = bufsize / sizeof (uint32);
     ctx->swizzles = swiz;
     ctx->swizzles_count = swizcount;
+    ctx->samplermap = smap;
+    ctx->samplermap_count = smapcount;
     ctx->endline = ENDLINE_STR;
     ctx->endline_len = strlen(ctx->endline);
     ctx->last_address_reg_component = -1;
     ctx->current_position = MOJOSHADER_POSITION_BEFORE;
+    ctx->texm3x2pad_dst0 = -1;
+    ctx->texm3x2pad_src0 = -1;
+    ctx->texm3x3pad_dst0 = -1;
+    ctx->texm3x3pad_src0 = -1;
+    ctx->texm3x3pad_dst1 = -1;
+    ctx->texm3x3pad_src1 = -1;
 
     ctx->errors = errorlist_create(MallocBridge, FreeBridge, ctx);
     if (ctx->errors == NULL)
@@ -7934,7 +8949,6 @@ static MOJOSHADER_sampler *build_samplers(Context *ctx)
     if (retval != NULL)
     {
         RegisterList *item = ctx->samplers.next;
-        MOJOSHADER_samplerType type = MOJOSHADER_SAMPLER_2D;
         int i;
 
         memset(retval, '\0', len);
@@ -7948,28 +8962,10 @@ static MOJOSHADER_sampler *build_samplers(Context *ctx)
             } // if
 
             assert(item->regtype == REG_TYPE_SAMPLER);
-            switch ((const TextureType) item->index)
-            {
-                case TEXTURE_TYPE_2D:
-                    type = MOJOSHADER_SAMPLER_2D;
-                    break;
-
-                case TEXTURE_TYPE_CUBE:
-                    type = MOJOSHADER_SAMPLER_CUBE;
-                    break;
-
-                case TEXTURE_TYPE_VOLUME:
-                    type = MOJOSHADER_SAMPLER_VOLUME;
-                    break;
-
-                default:
-                    fail(ctx, "Unknown sampler type");
-                    break;
-            } // switch
-
-            retval[i].type = type;
+            retval[i].type = cvtD3DToMojoSamplerType((TextureType) item->index);
             retval[i].index = item->regnum;
             retval[i].name = alloc_varname(ctx, item);
+            retval[i].texbem = (item->misc != 0) ? 1 : 0;
             item = item->next;
         } // for
     } // if
@@ -8341,6 +9337,17 @@ static void process_definitions(Context *ctx)
                     item = prev;
                     break;
 
+                case REG_TYPE_INPUT:
+                    // You don't have to dcl_ your inputs in Shader Model 1.
+                    if (shader_is_pixel(ctx)&&!shader_version_atleast(ctx,2,0))
+                    {
+                        add_attribute_register(ctx, regtype, regnum,
+                                               MOJOSHADER_USAGE_COLOR, regnum,
+                                               0xF, 0);
+                        break;
+                    } // if
+                    // fall through...
+
                 default:
                     fail(ctx, "BUG: we used a register we don't know how to define.");
             } // switch
@@ -8415,7 +9422,8 @@ static void process_definitions(Context *ctx)
     {
         ctx->sampler_count++;
         ctx->profile->sampler_emitter(ctx, item->regnum,
-                                      (TextureType) item->index);
+                                      (TextureType) item->index,
+                                      item->misc != 0);
     } // for
 
     // ...and attributes...
@@ -8452,8 +9460,8 @@ const MOJOSHADER_parseData *MOJOSHADER_parseExpression(const unsigned char *toke
     Context *ctx = NULL;
     if ( ((m == NULL) && (f != NULL)) || ((m != NULL) && (f == NULL)) )
         return NULL;  // supply both or neither.
-
-    ctx = build_context("glsl120", tokenbuf, bufsize, NULL, 0, m, f, d);
+    
+    ctx = build_context("glsl120", tokenbuf, bufsize, NULL, 0, NULL, 0, m, f, d);
     if (ctx == NULL)
         return NULL;
     
@@ -8466,11 +9474,18 @@ const MOJOSHADER_parseData *MOJOSHADER_parseExpression(const unsigned char *toke
 
 // API entry point...
 
+// !!! FIXME:
+// MSDN: "Shader validation will fail CreatePixelShader on any shader that
+//  attempts to read from a temporary register that has not been written by a
+//  previous instruction."  (true for ps_1_*, maybe others). Check this.
+
 const MOJOSHADER_parseData *MOJOSHADER_parse(const char *profile,
                                              const unsigned char *tokenbuf,
                                              const unsigned int bufsize,
                                              const MOJOSHADER_swizzle *swiz,
                                              const unsigned int swizcount,
+                                             const MOJOSHADER_samplerMap *smap,
+                                             const unsigned int smapcount,
                                              MOJOSHADER_malloc m,
                                              MOJOSHADER_free f, void *d)
 {
@@ -8482,7 +9497,8 @@ const MOJOSHADER_parseData *MOJOSHADER_parse(const char *profile,
     if ( ((m == NULL) && (f != NULL)) || ((m != NULL) && (f == NULL)) )
         return &MOJOSHADER_out_of_mem_data;  // supply both or neither.
 
-    ctx = build_context(profile, tokenbuf, bufsize, swiz, swizcount, m, f, d);
+    ctx = build_context(profile, tokenbuf, bufsize, swiz, swizcount,
+                        smap, smapcount, m, f, d);
     if (ctx == NULL)
         return &MOJOSHADER_out_of_mem_data;
 	
@@ -8537,6 +9553,15 @@ const MOJOSHADER_parseData *MOJOSHADER_parse(const char *profile,
     } // while
 
     ctx->current_position = MOJOSHADER_POSITION_AFTER;
+
+    // for ps_1_*, the output color is written to r0...throw an
+    //  error if this register was never written. This isn't
+    //  important for vertex shaders, or shader model 2+.
+    if (shader_is_pixel(ctx) && !shader_version_atleast(ctx, 2, 0))
+    {
+        if (!register_was_written(ctx, REG_TYPE_TEMP, 0))
+            fail(ctx, "r0 (pixel shader 1.x color output) never written to");
+    } // if
 
     if (!failed)
     {

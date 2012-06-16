@@ -377,6 +377,8 @@ static void print_shader(const char *fname, const MOJOSHADER_parseData *pd,
                 printf("    * %d: %s", s->index, typenames[(int) s->type]);
                 if (s->name != NULL)
                     printf(" (\"%s\")", s->name);
+                if (s->texbem)
+                    printf(" [TEXBEM]");
                 printf("\n");
             } // for
         } // else
@@ -487,7 +489,8 @@ static int do_parse(const char *fname, const unsigned char *buf,
          (buf[2] == 0xFF) && (buf[3] == 0xFE) )
     {
         const MOJOSHADER_effect *effect;
-        effect = MOJOSHADER_parseEffect(prof, buf, len, 0, 0, Malloc, Free, 0);
+        effect = MOJOSHADER_parseEffect(prof, buf, len, NULL, 0,
+                                        NULL, 0, Malloc, Free, 0);
         retval = (effect->error_count == 0);
         printf("EFFECT: %s\n", fname);
         print_effect(fname, effect, 1);
@@ -517,7 +520,8 @@ static int do_parse(const char *fname, const unsigned char *buf,
     else  // do it as a regular compiled shader.
     {
         const MOJOSHADER_parseData *pd;
-        pd = MOJOSHADER_parse(prof, buf, len, NULL, 0, Malloc, Free, NULL);
+        pd = MOJOSHADER_parse(prof, buf, len, NULL, 0,
+                              NULL, 0, Malloc, Free, NULL);
         retval = (pd->error_count == 0);
         printf("SHADER: %s\n", fname);
         print_shader(fname, pd, 1);

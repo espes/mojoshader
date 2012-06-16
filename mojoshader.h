@@ -176,13 +176,34 @@ typedef enum
  *  before drawing with the shader.
  * (name) is a profile-specific variable name; it may be NULL if it isn't
  *  applicable to the requested profile.
+ * (texbem) will be non-zero if a TEXBEM opcode references this sampler. This
+ *  is only used in legacy shaders (ps_1_1 through ps_1_3), but it needs some
+ *  special support to work, as we have to load a magic uniform behind the
+ *  scenes to support it. Most code can ignore this field in general, and no
+ *  one has to touch it unless they really know what they're doing.
  */
 typedef struct MOJOSHADER_sampler
 {
     MOJOSHADER_samplerType type;
     int index;
     const char *name;
+    int texbem;
 } MOJOSHADER_sampler;
+
+
+/*
+ * This struct is used if you have to force a sampler to a specific type.
+ *  Generally, you can ignore this, but if you have, say, a ps_1_1
+ *  shader, you might need to specify what the samplers are meant to be
+ *  to get correct results, as Shader Model 1 samples textures according
+ *  to what is bound to a sampler at the moment instead of what the shader
+ *  is hardcoded to expect.
+ */
+typedef struct MOJOSHADER_samplerMap
+{
+    int index;
+    MOJOSHADER_samplerType type;
+} MOJOSHADER_samplerMap;
 
 /*
  * Data types for attributes. See MOJOSHADER_attribute for more information.
@@ -699,6 +720,19 @@ void MOJOSHADER_runPreshader(const MOJOSHADER_preshader*, const float*, float*);
  *  input register in the code would produce reg.ywzx, that swizzle would
  *  change it to reg.wzxy ... (swiz) can be NULL.
  *
+ * You can force the shader to expect samplers of certain types. Generally
+ *  you don't need this, as Shader Model 2 and later always specify what they
+ *  expect samplers to be (2D, cubemap, etc). Shader Model 1, however, just
+ *  uses whatever is bound to a given sampler at draw time, but this doesn't
+ *  work in OpenGL, etc. In these cases, MojoShader will default to
+ *  2D texture sampling (or cubemap sampling, in cases where it makes sense,
+ *  like the TEXM3X3TEX opcode), which works 75% of the time, but if you
+ *  really needed something else, you'll need to specify it here. This can
+ *  also be used, at your own risk, to override DCL opcodes in shaders: if
+ *  the shader explicit says 2D, but you want Cubemap, for example, you can
+ *  use this to override. If you aren't sure about any of this stuff, you can
+ *  (and should) almost certainly ignore it: (smap) can be NULL.
+ *
  * This function is thread safe, so long as (m) and (f) are too, and that
  *  (tokenbuf) remains intact for the duration of the call. This allows you
  *  to parse several shaders on separate CPU cores at the same time.
@@ -708,6 +742,8 @@ const MOJOSHADER_parseData *MOJOSHADER_parse(const char *profile,
                                              const unsigned int bufsize,
                                              const MOJOSHADER_swizzle *swiz,
                                              const unsigned int swizcount,
+                                             const MOJOSHADER_samplerMap *smap,
+                                             const unsigned int smapcount,
                                              MOJOSHADER_malloc m,
                                              MOJOSHADER_free f,
                                              void *d);
@@ -858,6 +894,8 @@ const MOJOSHADER_effect *MOJOSHADER_parseEffect(const char *profile,
                                                 const unsigned int _len,
                                                 const MOJOSHADER_swizzle *swiz,
                                                 const unsigned int swizcount,
+                                                const MOJOSHADER_samplerMap *smap,
+                                                const unsigned int smapcount,
                                                 MOJOSHADER_malloc m,
                                                 MOJOSHADER_free f,
                                                 void *d);
@@ -2638,7 +2676,8 @@ int MOJOSHADER_glMaxUniforms(MOJOSHADER_shaderType shader_type);
  *
  *   (tokenbuf) is a buffer of Direct3D shader bytecode.
  *   (bufsize) is the size, in bytes, of the bytecode buffer.
- *   (swiz) and (swizcount) are passed to MOJOSHADER_parse() unmolested.
+ *   (swiz), (swizcount), (smap), and (smapcount) are passed to
+ *   MOJOSHADER_parse() unmolested.
  *
  * Returns NULL on error, or a shader handle on success.
  *
@@ -2654,7 +2693,9 @@ int MOJOSHADER_glMaxUniforms(MOJOSHADER_shaderType shader_type);
 MOJOSHADER_glShader *MOJOSHADER_glCompileShader(const unsigned char *tokenbuf,
                                                 const unsigned int bufsize,
                                                 const MOJOSHADER_swizzle *swiz,
-                                                const unsigned int swizcount);
+                                                const unsigned int swizcount,
+                                                const MOJOSHADER_samplerMap *smap,
+                                                const unsigned int smapcount);
 
 
 /*
@@ -3022,6 +3063,45 @@ void MOJOSHADER_glSetPixelShaderUniformB(unsigned int idx, const int *data,
  */
 void MOJOSHADER_glGetPixelShaderUniformB(unsigned int idx, int *data,
                                          unsigned int bcount);
+
+/*
+ * Set up the vector for the TEXBEM opcode. Most apps can ignore this API.
+ *
+ * Shader Model 1.1 through 1.3 had an instruction for "fake bump mapping"
+ *  called TEXBEM. To use it, you had to set some sampler states,
+ *  D3DTSS_BUMPENVMATxx, which would be referenced by the opcode.
+ *
+ * This functionality was removed from Shader Model 1.4 and later, because
+ *  it was special-purpose and limited. The functionality could be built on
+ *  more general opcodes, and the sampler state could be supplied in a more
+ *  general uniform.
+ *
+ * However, to support this opcode, we supply a way to specify that sampler
+ *  state, and the OpenGL glue code does the right thing to pass that
+ *  information to the shader.
+ *
+ * This call maps to IDirect3DDevice::SetTextureStageState() with the
+ *  D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+ *  D3DTSS_BUMPENVMAT11, D3DTSS_BUMPENVLSCALE, and D3DTSS_BUMPENVLOFFSET
+ *  targets. This is only useful for Shader Model < 1.4 pixel shaders, if
+ *  they use the TEXBEM or TEXBEML opcode. If you aren't sure, you don't need
+ *  this function.
+ *
+ * Like the rest of your uniforms, you must call MOJOSHADER_glProgramReady()
+ *  between setting new values and drawing with them.
+ *
+ * This call is NOT thread safe! As most OpenGL implementations are not thread
+ *  safe, you should probably only call this from the same thread that created
+ *  the GL context.
+ *
+ * This call requires a valid MOJOSHADER_glContext to have been made current,
+ *  or it will crash your program. See MOJOSHADER_glMakeContextCurrent().
+ *
+ * These values are not shared between contexts.
+ */
+void MOJOSHADER_glSetLegacyBumpMapEnv(unsigned int sampler, float mat00,
+                                      float mat01, float mat10, float mat11,
+                                      float lscale, float loffset);
 
 /*
  * Connect a client-side array to the currently-bound program.
