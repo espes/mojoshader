@@ -62,7 +62,7 @@ int hash_find(const HashTable *table, const void *key, const void **_value)
 int hash_iter(const HashTable *table, const void *key,
               const void **_value, void **iter)
 {
-    HashItem *item = *iter;
+    HashItem *item = (HashItem*)*iter;
     if (item == NULL)
         item = table->table[calc_hash(table, key)];
     else
@@ -87,7 +87,7 @@ int hash_iter(const HashTable *table, const void *key,
 
 int hash_iter_keys(const HashTable *table, const void **_key, void **iter)
 {
-    HashItem *item = *iter;
+    HashItem *item = (HashItem*)*iter;
     int idx = 0;
 
     if (item != NULL)

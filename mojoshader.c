@@ -8090,7 +8090,7 @@ static void parse_constant_table(Context *ctx, const uint32 *tokens,
     // !!! FIXME: check that (start+target) points to "ps_3_0", etc.
 
     ctab->symbol_count = constants;
-    ctab->symbols = Malloc(ctx, sizeof (MOJOSHADER_symbol) * constants);
+    ctab->symbols = (MOJOSHADER_symbol*)Malloc(ctx, sizeof (MOJOSHADER_symbol) * constants);
     if (ctab->symbols == NULL)
         return;
     memset(ctab->symbols, '\0', sizeof (MOJOSHADER_symbol) * constants);
@@ -8469,7 +8469,7 @@ static void parse_preshader(Context *ctx, uint32 tokcount)
             
             const unsigned int item = (unsigned int) SWAP32(fxlc.tokens[2]);
             
-            operand->type = SWAP32(fxlc.tokens[1]);
+            operand->type = (MOJOSHADER_preshaderOperandType)SWAP32(fxlc.tokens[1]);
 
             switch (operand->type)
             {
@@ -9267,6 +9267,8 @@ static void process_definitions(Context *ctx)
 
         if (!get_defined_register(ctx, regtype, regnum))
         {
+            MOJOSHADER_usage usage;
+
             // haven't already dealt with this one.
             switch (regtype)
             {
@@ -9285,7 +9287,7 @@ static void process_definitions(Context *ctx)
 
                     //find the usage
                     //hack copypastad from emit_GLSL_attribute
-                    MOJOSHADER_usage usage = MOJOSHADER_USAGE_UNKNOWN;
+                    usage = MOJOSHADER_USAGE_UNKNOWN;
                     if (regtype == REG_TYPE_RASTOUT)
                     {
                         switch ((const RastOutType) regnum)

@@ -221,7 +221,7 @@ const MOJOSHADER_effect *MOJOSHADER_parseEffect(const char *profile,
     if (m == NULL) m = MOJOSHADER_internal_malloc;
     if (f == NULL) f = MOJOSHADER_internal_free;
 
-    MOJOSHADER_effect *retval = m(sizeof (MOJOSHADER_effect), d);
+    MOJOSHADER_effect *retval = (MOJOSHADER_effect*)m(sizeof (MOJOSHADER_effect), d);
     if (retval == NULL)
         return &MOJOSHADER_out_of_mem_effect;  // supply both or neither.
     memset(retval, '\0', sizeof (*retval));
@@ -454,7 +454,7 @@ const MOJOSHADER_effect *MOJOSHADER_parseEffect(const char *profile,
     if (numtextures > 0)
     {
         siz = sizeof (MOJOSHADER_effectTexture) * numtextures;
-        retval->textures = m(siz, d);
+        retval->textures = (MOJOSHADER_effectTexture*)m(siz, d);
         if (retval->textures == NULL)
             goto parseEffect_outOfMemory;
         memset(retval->textures, '\0', siz);
@@ -473,7 +473,7 @@ const MOJOSHADER_effect *MOJOSHADER_parseEffect(const char *profile,
                 goto parseEffect_unexpectedEOF;
 
             texture->param = texparam;
-            char *str = m(texsize + 1, d);
+            char *str = (char*)m(texsize + 1, d);
             if (str == NULL)
                 goto parseEffect_outOfMemory;
             memcpy(str, ptr, texsize);
