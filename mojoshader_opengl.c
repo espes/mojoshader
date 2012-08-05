@@ -2451,7 +2451,8 @@ void MOJOSHADER_glProgramReady(void)
             // !!! FIXME: set constants that overlap the array.
         } // for
 
-        if (program->texbem_count)
+        assert((!program->texbem_count) || (program->fragment));
+        if ((program->texbem_count) && (program->fragment))
         {
             const MOJOSHADER_parseData *pd = program->fragment->parseData;
             const int samp_count = pd->sampler_count;
@@ -2479,7 +2480,7 @@ void MOJOSHADER_glProgramReady(void)
             } // for
 
             assert(texbem_count == program->texbem_count);
-        } // for
+        } // if
 
         program->generation = ctx->generation;
 
