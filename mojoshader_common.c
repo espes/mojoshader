@@ -552,8 +552,6 @@ int errorlist_add_va(ErrorList *list, const char *_fname,
         va_end(ap);
     } // else
 
-    printf("fail - %s\n", failstr);
-
     error->error.error = failstr;
     error->error.filename = fname;
     error->error.error_position = errpos;
