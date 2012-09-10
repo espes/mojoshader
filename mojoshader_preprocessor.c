@@ -2274,6 +2274,7 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
         goto preprocess_out_of_mem;
 
     const char* include_filename = 0;
+    unsigned int include_line = 0;
 
     while ((tokstr = preprocessor_nexttoken(pp, &len, &token)) != NULL)
     {
@@ -2281,11 +2282,13 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
 		{
 			IncludeState* include = ((Context*)pp)->include_stack;
 
-			if (include_filename != include->filename)
+			if (include_filename != include->filename || include_line != include->line)
 			{
 				include_filename = include->filename;
+				include_line = include->line;
 
-		        buffer_append_fmt(buffer, "\n#line %d ", include->line);
+		        if (!nl) buffer_append(buffer, endline, sizeof (endline));
+		        buffer_append_fmt(buffer, "#line %d ", include->line);
 		        buffer_append_quoted_string(buffer, include->filename);
 		        buffer_append(buffer, endline, sizeof (endline));
 			}
