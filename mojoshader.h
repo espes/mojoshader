@@ -1027,6 +1027,15 @@ typedef int (*MOJOSHADER_includeOpen)(MOJOSHADER_includeType inctype,
 typedef void (*MOJOSHADER_includeClose)(const char *data,
                             MOJOSHADER_malloc m, MOJOSHADER_free f, void *d);
 
+/**
+ * This callback allows an app to resolve the include file path based on
+ * include type and parent include path.
+ *
+ * Note: the return value must be allocated using duplicate(duplicateContext, result) call.
+ */
+typedef const char* (*MOJOSHADER_includeResolve)(MOJOSHADER_includeType inctype,
+                            const char *fname, const char *parent,
+                            const char* (*duplicate)(void*, const char*), void* duplicateContext);
 
 /*
  * This function is optional. Even if you are dealing with shader source
@@ -1090,6 +1099,7 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
                              unsigned int define_count,
                              MOJOSHADER_includeOpen include_open,
                              MOJOSHADER_includeClose include_close,
+                             MOJOSHADER_includeResolve include_resolve,
                              MOJOSHADER_malloc m, MOJOSHADER_free f, void *d);
 
 

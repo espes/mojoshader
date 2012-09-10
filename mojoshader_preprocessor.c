@@ -55,6 +55,7 @@ typedef struct Context
     StringCache *filename_cache;
     MOJOSHADER_includeOpen open_callback;
     MOJOSHADER_includeClose close_callback;
+    MOJOSHADER_includeResolve resolve_callback;
     MOJOSHADER_malloc malloc;
     MOJOSHADER_free free;
     void *malloc_data;
@@ -599,6 +600,7 @@ Preprocessor *preprocessor_start(const char *fname, const char *source,
                             unsigned int sourcelen,
                             MOJOSHADER_includeOpen open_callback,
                             MOJOSHADER_includeClose close_callback,
+                            MOJOSHADER_includeResolve resolve_callback,
                             const MOJOSHADER_preprocessorDefine *defines,
                             unsigned int define_count, int asm_comments,
                             MOJOSHADER_malloc m, MOJOSHADER_free f, void *d)
@@ -620,6 +622,7 @@ Preprocessor *preprocessor_start(const char *fname, const char *source,
     ctx->malloc_data = d;
     ctx->open_callback = open_callback;
     ctx->close_callback = close_callback;
+    ctx->resolve_callback = resolve_callback;
     ctx->asm_comments = asm_comments;
 
     ctx->filename_cache = stringcache_create(MallocBridge, FreeBridge, ctx);
@@ -746,6 +749,10 @@ static int token_to_int(IncludeState *state)
     return atoi(buf);
 } // token_to_int
 
+static const char* duplicate_pp_callback(void* context, const char* value)
+{
+	return stringcache((StringCache*)context, value);
+}
 
 static void handle_pp_include(Context *ctx)
 {
@@ -807,16 +814,31 @@ static void handle_pp_include(Context *ctx)
         return;
     } // if
 
-    if (!ctx->open_callback(incltype, filename, state->source_base,
+    const char* filepath = filename;
+
+    if (ctx->resolve_callback != NULL)
+    {
+		const char* resfile = ctx->resolve_callback(incltype, filename, state->filename, duplicate_pp_callback, ctx->filename_cache);
+
+		if (!resfile)
+		{
+	        failf(ctx, "Cannot resolve include file: '%s'", filename);
+	        return;
+		}
+
+		filepath = resfile;
+    }
+
+    if (!ctx->open_callback(incltype, filepath, state->source_base,
                             &newdata, &newbytes, ctx->malloc,
                             ctx->free, ctx->malloc_data))
     {
-        fail(ctx, "Include callback failed");  // !!! FIXME: better error
+        failf(ctx, "Cannot open include file: '%s'", filename);
         return;
     } // if
 
     MOJOSHADER_includeClose callback = ctx->close_callback;
-    if (!push_source(ctx, filename, newdata, newbytes, 1, callback))
+    if (!push_source(ctx, filepath, newdata, newbytes, 1, callback))
     {
         assert(ctx->out_of_memory);
         ctx->close_callback(newdata, ctx->malloc, ctx->free, ctx->malloc_data);
@@ -2191,6 +2213,7 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
                              unsigned int define_count,
                              MOJOSHADER_includeOpen include_open,
                              MOJOSHADER_includeClose include_close,
+                             MOJOSHADER_includeResolve include_resolve,
                              MOJOSHADER_malloc m, MOJOSHADER_free f, void *d)
 {
     MOJOSHADER_preprocessData *retval = NULL;
@@ -2219,7 +2242,7 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
     if (!include_close) include_close = MOJOSHADER_internal_include_close;
 
     pp = preprocessor_start(filename, source, sourcelen,
-                            include_open, include_close,
+                            include_open, include_close, include_resolve,
                             defines, define_count, 0, m, f, d);
     if (pp == NULL)
         goto preprocess_out_of_mem;
