@@ -928,6 +928,14 @@ typedef enum
 
 
 /*
+ * Preprocessing flags
+ */
+typedef enum
+{
+	MOJOSHADER_PREPROCESS_EMITLINE = (1 << 0), /* emit #line directives */
+} MOJOSHADER_preprocessFlags;
+
+/*
  * Structure used to return data from preprocessing of a shader...
  */
 /* !!! FIXME: most of these ints should be unsigned. */
@@ -1100,6 +1108,7 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
                              MOJOSHADER_includeOpen include_open,
                              MOJOSHADER_includeClose include_close,
                              MOJOSHADER_includeResolve include_resolve,
+                             unsigned int flags,
                              MOJOSHADER_malloc m, MOJOSHADER_free f, void *d);
 
 

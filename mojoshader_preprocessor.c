@@ -2199,6 +2199,23 @@ static void indent_buffer(Buffer *buffer, int n, const int newline)
     } // else
 } // indent_buffer
 
+static void buffer_append_quoted_string(Buffer *buffer, const char* str)
+{
+	buffer_append(buffer, "\"", 1);
+
+	for (; *str; ++str)
+	{
+		if (*str == '\\' || *str == '\"')
+		{
+			buffer_append(buffer, "\\", 1);
+			buffer_append(buffer, str, 1);
+		}
+		else
+			buffer_append(buffer, str, 1);
+	}
+
+	buffer_append(buffer, "\"", 1);
+}
 
 static const MOJOSHADER_preprocessData out_of_mem_data_preprocessor = {
     1, &MOJOSHADER_out_of_mem_error, 0, 0, 0, 0, 0
@@ -2214,6 +2231,7 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
                              MOJOSHADER_includeOpen include_open,
                              MOJOSHADER_includeClose include_close,
                              MOJOSHADER_includeResolve include_resolve,
+                             unsigned int flags,
                              MOJOSHADER_malloc m, MOJOSHADER_free f, void *d)
 {
     MOJOSHADER_preprocessData *retval = NULL;
@@ -2255,8 +2273,24 @@ const MOJOSHADER_preprocessData *MOJOSHADER_preprocess(const char *filename,
     if (buffer == NULL)
         goto preprocess_out_of_mem;
 
+    const char* include_filename = 0;
+
     while ((tokstr = preprocessor_nexttoken(pp, &len, &token)) != NULL)
     {
+		if (flags & MOJOSHADER_PREPROCESS_EMITLINE)
+		{
+			IncludeState* include = ((Context*)pp)->include_stack;
+
+			if (include_filename != include->filename)
+			{
+				include_filename = include->filename;
+
+		        buffer_append_fmt(buffer, "\n#line %d ", include->line);
+		        buffer_append_quoted_string(buffer, include->filename);
+		        buffer_append(buffer, endline, sizeof (endline));
+			}
+		}
+
         int isnewline = 0;
 
         assert(token != TOKEN_EOI);
