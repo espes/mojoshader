@@ -150,6 +150,7 @@ void MOJOSHADER_print_debug_token(const char *subsystem, const char *token,
         TOKENCASE(TOKEN_ANDASSIGN);
         TOKENCASE(TOKEN_ORASSIGN);
         TOKENCASE(TOKEN_INCREMENT);
+        TOKENCASE(TOKEN_COLONCOLON);
         TOKENCASE(TOKEN_DECREMENT);
         TOKENCASE(TOKEN_RSHIFT);
         TOKENCASE(TOKEN_LSHIFT);

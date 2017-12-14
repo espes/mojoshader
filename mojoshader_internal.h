@@ -463,6 +463,7 @@ typedef enum
     TOKEN_NEQ,
     TOKEN_HASH,
     TOKEN_HASHHASH,
+    TOKEN_COLONCOLON,
 
     // This is returned at the end of input...no more to process.
     TOKEN_EOI,

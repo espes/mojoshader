@@ -130,6 +130,7 @@ scanner_loop:
     "!="            { RET(TOKEN_NEQ); }
     "#"             { RET(TOKEN_HASH); }
     "##"            { RET(TOKEN_HASHHASH); }
+    "::"            { RET(TOKEN_COLONCOLON); }
     "("             { RET('('); }
     ")"             { RET(')'); }
     "["             { RET('['); }
